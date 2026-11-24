@@ -492,9 +492,13 @@ fn parse_user_toast_data(data: &Value, ev: &mut RawBiliEvent) -> bool {
 }
 
 fn normalize_bili_ts_ms(ts: u64, fallback_ms: u64) -> u64 {
-    if ts > 1_000_000_000_000 {
+    if ts >= 1_000_000_000_000_000_000 {
+        ts / 1_000_000
+    } else if ts >= 1_000_000_000_000_000 {
+        ts / 1_000
+    } else if ts >= 1_000_000_000_000 {
         ts
-    } else if ts > 1_000_000_000 {
+    } else if ts >= 1_000_000_000 {
         ts.saturating_mul(1000)
     } else {
         fallback_ms
@@ -970,6 +974,18 @@ fn parse_single_bili_cmd_json(
             let data = payload.get("data")?;
             let msg_type = data.get("msg_type").and_then(value_as_u64).unwrap_or(1);
             let (kind, content) = parse_interact_msg_type(msg_type)?;
+            let trigger_ms = data
+                .get("trigger_time")
+                .and_then(value_as_u64)
+                .map(|t| normalize_bili_ts_ms(t, 0))
+                .unwrap_or(0);
+            ev.timestamp = if trigger_ms > 0 {
+                trigger_ms
+            } else if let Some(ts) = data.get("timestamp").and_then(value_as_u64) {
+                normalize_bili_ts_ms(ts, now)
+            } else {
+                now
+            };
             ev.uid = data.get("uid").and_then(value_as_u64).unwrap_or(0);
             ev.uname = data
                 .get("uname")
@@ -993,12 +1009,21 @@ fn parse_single_bili_cmd_json(
             let bytes = BASE64_STANDARD.decode(pb_b64).ok()?;
             let decoded = decode_interact_word(bytes.as_slice())?;
             let (kind, content) = parse_interact_msg_type(u64::from(decoded.msg_type))?;
-            let ts_source = if decoded.timestamp_ms > 0 {
-                decoded.timestamp_ms
+            // Field 8 (`timestamp_ms`) is actually Bilibili's priority-queue `score`,
+            // which is often boosted hours into the future for VIP/medal/guard users.
+            // Prefer `trigger_time` (ns) and `timestamp` (s) for wall-clock event time.
+            let trigger_ms = if decoded.trigger_time > 0 {
+                normalize_bili_ts_ms(decoded.trigger_time, 0)
             } else {
-                u64::from(decoded.timestamp)
+                0
             };
-            ev.timestamp = normalize_bili_ts_ms(ts_source, now);
+            ev.timestamp = if trigger_ms > 0 {
+                trigger_ms
+            } else if decoded.timestamp > 0 {
+                normalize_bili_ts_ms(u64::from(decoded.timestamp), now)
+            } else {
+                now
+            };
             ev.uid = decoded.uid;
             ev.uname = decoded.username.trim().to_string();
             ev.msg_type = Some(decoded.msg_type);
@@ -1357,7 +1382,9 @@ mod tests {
                 name: "星光".to_string(),
                 ..Default::default()
             }),
-            timestamp_ms: 1795219205123,
+            timestamp: 1795219205,
+            timestamp_ms: 1795229205123, // boosted priority score must be ignored
+            trigger_time: 1_795_219_205_123_000_000,
             guard_type: 3,
             ..Default::default()
         };
@@ -1370,7 +1397,7 @@ mod tests {
         assert_eq!(enriched["data"]["pb_decoded"]["username"], "老粉丁");
         assert_eq!(enriched["data"]["pb_decoded"]["medal"]["name"], "星光");
 
-        // msg_type == 4 maps independently to special_follow
+        // msg_type == 4 maps independently to special_follow and uses trigger_time over boosted score
         let ev_special_follow =
             parse_bili_cmd_json("INTERACT_WORD_V2", &raw_pb, 21465419, "主播A").unwrap();
         assert_eq!(ev_special_follow.kind, "special_follow");
@@ -1573,7 +1600,60 @@ mod tests {
         assert_eq!(ev_iw.uname, "苦艾酒丶_");
         assert_eq!(ev_iw.medal_name.as_deref(), Some("玉友"));
         assert_eq!(ev_iw.medal_level, Some(7));
-        assert_eq!(ev_iw.timestamp, 1795268623936);
+        assert_eq!(ev_iw.timestamp, 1795268622874);
+
+        // Real INTERACT_WORD_V2 capture where tag 8 (`timestamp_ms`/priority score = 1795489911498)
+        // is +10,019s ahead of the real `trigger_time` (1795479891337195194) and `timestamp` (1795479892).
+        let boosted_iw_b64 = "CKC/+fEDEhjoh7TmlazkvKDlpYfmipfljovnjos0ODYiAgMBKAEwpq+9DjjUspPYBkDKpafcoDRKMwjal4D27cOaBhAEGgnlsI/mnpXpsrggjq3yAiiOrfICMI6t8gI4jq3yAkABYKavvQ5oE2IAeLrdiqSs7rT1GJoBALIB4QEIoL/58QMSZgoY6Ie05pWs5Lyg5aWH5oqX5Y6L546LNDg2EkpodHRwczovL2kxLmhkc2xiLmNvbS9iZnMvZmFjZS80YWNmZTM1OTcxYzYxOGY0MzVkZjAxOTRmYjM2ZGQzMjJiYWZhMmY1LmpwZxprCgnlsI/mnpXpsrgQBBiOrfICII6t8gIojq3yAjCOrfICOKicSEgBUNqXgPbtw5oGYBN6CSM1NzYyQTc5OYIBCSM1NzYyQTc5OYoBCSM1NzYyQTc5OZIBByNGRkZGRkaaAQkjNTc2MkE3RTYiAggfMgC6AXYKSmh0dHBzOi8vaTAuaGRzbGIuY29tL2Jmcy9saXZlL2EwNGEwYmVmZGJiMWVjNThjYjFmMDBiZGIzMDA2NzIwMWVhN2I2MTUucG5nEibov5HmnJ/mipXlloLov4fvvIzlpJrlpJrkuI5UQeS6kuWKqOWQpxgCwgEA";
+        let ev_boosted = parse_bili_cmd_json(
+            "INTERACT_WORD_V2",
+            &json!({"cmd": "INTERACT_WORD_V2", "data": {"pb": boosted_iw_b64}}),
+            21465419,
+            "主播",
+        )
+        .unwrap();
+        assert_eq!(ev_boosted.kind, "enter");
+        assert_eq!(ev_boosted.uname, "致敬传奇抗压王486");
+        assert_eq!(ev_boosted.timestamp, 1_795_479_891_337);
+
+        // Fallback to `timestamp` (seconds) when `trigger_time` is absent, still ignoring boosted `timestamp_ms`.
+        let fallback_pb = EventInteractWord {
+            uid: 123,
+            username: "测试观众".to_string(),
+            msg_type: 1,
+            timestamp: 1_795_479_892,
+            timestamp_ms: 1_795_499_999_999,
+            trigger_time: 0,
+            ..Default::default()
+        };
+        let ev_fallback = parse_bili_cmd_json(
+            "INTERACT_WORD_V2",
+            &json!({"cmd": "INTERACT_WORD_V2", "data": {"pb": BASE64_STANDARD.encode(fallback_pb.encode_to_vec())}}),
+            21465419,
+            "主播",
+        )
+        .unwrap();
+        assert_eq!(ev_fallback.timestamp, 1_795_479_892_000);
+
+        // INTERACT_WORD JSON v1 also uses trigger_time/timestamp rather than score
+        let ev_v1 = parse_bili_cmd_json(
+            "INTERACT_WORD",
+            &json!({
+                "cmd": "INTERACT_WORD",
+                "data": {
+                    "uid": 123,
+                    "uname": "JSON观众",
+                    "msg_type": 1,
+                    "timestamp": 1_795_479_892u64,
+                    "trigger_time": 1_795_479_891_555_000_000u64,
+                    "score": 1_795_499_999_999u64
+                }
+            }),
+            21465419,
+            "主播",
+        )
+        .unwrap();
+        assert_eq!(ev_v1.timestamp, 1_795_479_891_555);
 
         // Real SEND_GIFT_V2 capture with blind_gift, 2 gift_items, gift medal, and sender_uinfo (tag 18 string)
         let sg_b64 = "CIa9+sABEgtIZW5jeea4hee8mBpKaHR0cHM6Ly9pMS5oZHNsYi5jb20vYmZzL2ZhY2UvOGE4N2RjMmUxZjZjMTJkY2YxN2IxZTMwMWRmYTEzYmY2OGJhODAyNC5qcGdCKAjrvv4JKDUyB+WWj2/nsbM4i8L9B0CLwv0HSISh/wdQ1ND/B1gBYAFKIAiLARD7+wEaDOW/g+WKqOebsuebkioG54iG5Ye6MJh1UuwECP76ARIJ5qOJ6Iqx57OWGAYgAiioRjCoRjiQvwVCBGdvbGRKEzQ4NDE2MDg4NDA4OTIwMDU4ODhQy+mG2AZYAWIkYmNmYWRkZGEtNTU1NC00ZWNiLWI5NDMtNWY4OWViNGQ2OWEzaApw8KUDeAiFAQAAgD+IAQGSAQbmipXlloLAAbHeEeoBGAoN5rSb5biMUm9zZXR0ZRCEl4CS+e/KBooC0QEIhJeAkvnvygYSxQEKDea0m+W4jFJvc2V0dGUSSmh0dHBzOi8vaTIuaGRzbGIuY29tL2Jmcy9mYWNlLzQ3ZjI3Nzk3NzA0NzQ5MTI4ZmI1OTI1NzhlNjljZjk2MjBjNWU0ZjMuanBnMlsKDea0m+W4jFJvc2V0dGUSSmh0dHBzOi8vaTIuaGRzbGIuY29tL2Jmcy9mYWNlLzQ3ZjI3Nzk3NzA0NzQ5MTI4ZmI1OTI1NzhlNjljZjk2MjBjNWU0ZjMuanBnOgsg////////////AZICAhACmgLlAQpKaHR0cHM6Ly9zMS5oZHNsYi5jb20vYmZzL2xpdmUvYjU1NTY4MmFmNDE1NTFjMjhmOGFkMTlkYzVjNGVkODc5NDNjODRmNC5wbmcSS2h0dHBzOi8vaTAuaGRzbGIuY29tL2Jmcy9saXZlLzNkZmI3NTMwNjVjOTY3NjUzZGMzNWJlMWRmODUzMjIxODhhODg2MjUud2VicCpKaHR0cHM6Ly9pMC5oZHNsYi5jb20vYmZzL2xpdmUvOTc2NTJhNzI0YzYxMGIzZTdkZjJmNDlhNGZjODI3NjlhNGIwYzA2Mi5naWagAqhGqgICCAJS7wQIgPsBEgzniLHlv4PmirHmnpUYBCACKIB9MIB9OODUA0IEZ29sZEoTNDg0MTYwODg0MDg5MjAwNTg4OVDL6YbYBlgBYiQyN2JhZDU1Yi1jYTE4LTQwNDEtOWRmNi03OTRmNWNiMjc2NTloCnCA9AN4CIUBAACAP4gBAZIBBuaKleWWgsABld8R6gEYCg3mtJvluIxSb3NldHRlEISXgJL578oGigLRAQiEl4CS+e/KBhLFAQoN5rSb5biMUm9zZXR0ZRJKaHR0cHM6Ly9pMi5oZHNsYi5jb20vYmZzL2ZhY2UvNDdmMjc3OTc3MDQ3NDkxMjhmYjU5MjU3OGU2OWNmOTYyMGM1ZTRmMy5qcGcyWwoN5rSb5biMUm9zZXR0ZRJKaHR0cHM6Ly9pMi5oZHNsYi5jb20vYmZzL2ZhY2UvNDdmMjc3OTc3MDQ3NDkxMjhmYjU5MjU3OGU2OWNmOTYyMGM1ZTRmMy5qcGc6CyD///////////8BkgICEAKaAuUBCkpodHRwczovL3MxLmhkc2xiLmNvbS9iZnMvbGl2ZS84MjQ3MTRjODMwOTY2ZDdiZWMzODFlMzVlZjgwOGIxZjQ3OGUyMWVlLnBuZxJLaHR0cHM6Ly9pMC5oZHNsYi5jb20vYmZzL2xpdmUvMzJjOGVlNDI1NjY1MDE4MjJkOGVjYzY4YjMzY2QyYzY0OTM3MjY2YS53ZWJwKkpodHRwczovL2kwLmhkc2xiLmNvbS9iZnMvbGl2ZS9hZTgwZDgwZWE3NThmZjA4ZmI0ZTJjNDIyNmFiN2I1MDExYjcyOGE2LmdpZqACgH2qAgIIAlgBagIIM3r9AgiGvfrAARLBAQoLSGVuY3nmuIXnvJgSSmh0dHBzOi8vaTEuaGRzbGIuY29tL2Jmcy9mYWNlLzhhODdkYzJlMWY2YzEyZGNmMTdiMWUzMDFkZmExM2JmNjhiYTgwMjQuanBnMlkKC0hlbmN55riF57yYEkpodHRwczovL2kxLmhkc2xiLmNvbS9iZnMvZmFjZS84YTg3ZGMyZTFmNmMxMmRjZjE3YjFlMzAxZGZhMTNiZjY4YmE4MDI0LmpwZzoLIP///////////wEasAEKB+WWj2/nsbMQNRiLwv0HIISh/wco1ND/BzCLwv0HSAFQ677+CVgBYILpvQNqSmh0dHBzOi8vaTAuaGRzbGIuY29tL2Jmcy9saXZlL2JmNGY1ZWE0YjU0Y2E3YmIzNThkZWM0ZTZjNGFmY2MzMDBjMTJlYjkucG5negkjRUM0RjZFOTmCAQkjRUM0RjZFOTmKAQcjRjE4MDg3kgEHI0ZGRkZGRpoBCSNFQzRGNkVFNg==";

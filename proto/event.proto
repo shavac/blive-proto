@@ -145,6 +145,9 @@ message EventInteractWord {
   uint32 msg_type = 5;
   uint32 room_id = 6;
   uint32 timestamp = 7;
+  // Note: Bilibili wire field 8 is actually a priority-queue `score` (often boosted
+  // hours ahead for VIP/medal/guard users), not a wall-clock timestamp. Kept named
+  // `timestamp_ms` for backwards compatibility; use `trigger_time` (ns) or `timestamp` (s).
   uint64 timestamp_ms = 8;
   EventInteractMedal medal = 9;
   uint64 trigger_time = 15;
