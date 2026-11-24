@@ -16,7 +16,7 @@ Add `blive-proto` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-blive-proto = "0.1"
+blive-proto = "0.2"
 ```
 
 Because `blive-proto` bundles `protoc-bin-vendored`, building on Linux, macOS, and Windows works out of the box without installing `protoc` separately (if `PROTOC` is set in the environment, it is respected).
