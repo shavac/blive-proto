@@ -1,7 +1,9 @@
 // src/commands.rs
 //! Stateless Bilibili live command, room metadata, SuperChat, and cookie protocol parsers.
 
-use crate::models::{RawBiliEvent, RoomInfoSnapshot, now_unix_ms};
+use crate::models::{
+    QrCodeInfo, RawBiliEvent, RoomInfoSnapshot, RoomMetaUpdate, RoomQuickItem, now_unix_ms,
+};
 pub use crate::pb::normalize_bili_url;
 use crate::pb::{
     EventDm, PbExtractedUser, decode_dm, decode_interact_word, decode_send_gift,
@@ -9,9 +11,11 @@ use crate::pb::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
+use clru::CLruCache;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::OnceLock;
 
 /// Extract numeric Bilibili room ID from raw digits, live URLs (`https://live.bilibili.com/...`),
@@ -1240,6 +1244,384 @@ pub fn parse_active_super_chats_json(
     events
 }
 
+/// Parse anchor username from `https://api.live.bilibili.com/live_user/v1/Master/info`.
+pub fn parse_master_info_uname(json: &Value) -> Option<String> {
+    if json["code"].as_i64() != Some(0) {
+        return None;
+    }
+    json["data"]["info"]["uname"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Parse room metadata from `https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom`.
+pub fn parse_get_info_by_room_json(
+    json: &Value,
+    fallback_room_id: u64,
+) -> Option<RoomInfoSnapshot> {
+    if json["code"].as_i64() != Some(0) {
+        return None;
+    }
+    let data = &json["data"];
+    let room_info = &data["room_info"];
+    let long_id = value_as_u64(&room_info["room_id"]).unwrap_or(fallback_room_id);
+    if long_id == 0 {
+        return None;
+    }
+    let short_id = value_as_u64(&room_info["short_id"]).unwrap_or(0);
+    let uid = value_as_u64(&room_info["uid"]).unwrap_or(0);
+    let live_status = value_as_u64(&room_info["live_status"])
+        .and_then(|v| u8::try_from(v).ok())
+        .unwrap_or(0);
+    let start_time =
+        value_as_u64(&room_info["live_start_time"]).filter(|&t| live_status == 1 && t > 0);
+    let title = room_info["title"].as_str().unwrap_or("").trim().to_string();
+    let area_name = room_info["area_name"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let parent_area_name = room_info["parent_area_name"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let uname = data["anchor_info"]["base_info"]["uname"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Some(RoomInfoSnapshot {
+        room_id: long_id,
+        short_id,
+        uid,
+        uname,
+        title,
+        area_name,
+        parent_area_name,
+        live_status,
+        start_time,
+    })
+}
+
+/// Parse fallback room metadata from `https://api.live.bilibili.com/room/v1/Room/room_init`.
+pub fn parse_room_init_json(
+    json: &Value,
+    fallback_room_id: u64,
+) -> Result<RoomInfoSnapshot, String> {
+    if json["code"].as_i64() != Some(0) {
+        return Err(format!(
+            "Bilibili room_init failed (code {}): {}",
+            json["code"].as_i64().unwrap_or(-1),
+            json["message"].as_str().unwrap_or("unknown")
+        ));
+    }
+    let data = &json["data"];
+    let long_id = value_as_u64(&data["room_id"]).unwrap_or(fallback_room_id);
+    let short_id = value_as_u64(&data["short_id"]).unwrap_or(0);
+    let uid = value_as_u64(&data["uid"]).unwrap_or(0);
+    let live_status = value_as_u64(&data["live_status"])
+        .and_then(|v| u8::try_from(v).ok())
+        .unwrap_or(0);
+    let start_time = value_as_u64(&data["live_time"]).filter(|&t| live_status == 1 && t > 0);
+    Ok(RoomInfoSnapshot {
+        room_id: long_id,
+        short_id,
+        uid,
+        live_status,
+        start_time,
+        ..Default::default()
+    })
+}
+
+/// Extract `buvid3` (`data.b_3`) from `https://api.bilibili.com/x/frontend/finger/spi`.
+pub fn parse_buvid3_spi_json(json: &Value) -> Option<String> {
+    json["data"]["b_3"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extract `buvid3` from HTTP `Set-Cookie` headers returned by `https://data.bilibili.com/v/`.
+pub fn parse_set_cookie_buvid3(set_cookies: &[String]) -> Option<String> {
+    for hdr in set_cookies {
+        if let Some(val) = hdr
+            .split(';')
+            .next()
+            .and_then(|kv| kv.trim().strip_prefix("buvid3="))
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+/// Parse `https://passport.bilibili.com/x/passport-login/web/qrcode/generate` JSON.
+pub fn parse_qr_generate_response(resp: &Value) -> Result<QrCodeInfo, String> {
+    let code = resp["code"].as_i64().unwrap_or(-1);
+    if code != 0 {
+        return Err(format!(
+            "QR generate API failed (code {}): {}",
+            code,
+            resp["message"].as_str().unwrap_or("unknown")
+        ));
+    }
+    let url = resp["data"]["url"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "QR generate response missing data.url".to_string())?
+        .to_string();
+    let qrcode_key = resp["data"]["qrcode_key"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "QR generate response missing data.qrcode_key".to_string())?
+        .to_string();
+    Ok(QrCodeInfo { url, qrcode_key })
+}
+
+/// Parse `https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld` JSON into the user's room item.
+pub fn parse_my_room_response(resp: &Value, room_uname: &str) -> Option<RoomQuickItem> {
+    if resp["code"].as_i64() != Some(0) {
+        return None;
+    }
+    let data = &resp["data"];
+    let room_status = data["roomStatus"].as_i64().unwrap_or(0);
+    let room_id = value_as_u64(&data["roomid"]).unwrap_or(0);
+    if room_status == 1 && room_id > 0 {
+        Some(RoomQuickItem {
+            room_id,
+            room_uname: room_uname.to_string(),
+            title: data["title"].as_str().unwrap_or("").to_string(),
+            is_live: data["liveStatus"].as_i64() == Some(1),
+        })
+    } else {
+        None
+    }
+}
+
+/// Parse `https://api.live.bilibili.com/relation/v1/feed/feed_list` JSON into live followed rooms.
+/// Returns `None` when the response indicates an API error so fallback endpoints can run.
+pub fn parse_following_feed_list_response(json: &Value) -> Option<Vec<RoomQuickItem>> {
+    if json["code"].as_i64() != Some(0) {
+        return None;
+    }
+    let arr = json["data"]["list"].as_array()?;
+    let items = arr
+        .iter()
+        .filter_map(|item| {
+            let room_id = value_as_u64(&item["roomid"])?;
+            if room_id == 0 {
+                return None;
+            }
+            Some(RoomQuickItem {
+                room_id,
+                room_uname: item["uname"].as_str().unwrap_or("").to_string(),
+                title: item["title"].as_str().unwrap_or("").to_string(),
+                is_live: true,
+            })
+        })
+        .collect();
+    Some(items)
+}
+
+/// Parse `https://api.live.bilibili.com/xlive/web-ucenter/user/following` JSON into currently live rooms.
+pub fn parse_following_live_response(resp: &Value) -> Vec<RoomQuickItem> {
+    if resp["code"].as_i64() != Some(0) {
+        return Vec::new();
+    }
+    resp["data"]["list"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|item| item["live_status"].as_i64() == Some(1))
+                .filter_map(|item| {
+                    let room_id = value_as_u64(&item["roomid"])?;
+                    if room_id == 0 {
+                        return None;
+                    }
+                    Some(RoomQuickItem {
+                        room_id,
+                        room_uname: item["uname"].as_str().unwrap_or("").to_string(),
+                        title: item["title"].as_str().unwrap_or("").to_string(),
+                        is_live: true,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Apply live room lifecycle/metadata packets (`LIVE`, `PREPARING`, `ROOM_CHANGE`) to `meta`.
+pub fn apply_room_meta_cmd(
+    meta: &mut RoomInfoSnapshot,
+    payload: &Value,
+    now_ms: u64,
+) -> RoomMetaUpdate {
+    let cmd = payload.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
+    let base_cmd = cmd.split(':').next().unwrap_or(cmd);
+    match base_cmd {
+        "LIVE" => {
+            let start_sec = payload
+                .get("live_time")
+                .or_else(|| payload.get("data").and_then(|d| d.get("live_time")))
+                .and_then(|v| {
+                    value_as_u64(v).or_else(|| {
+                        v.as_str()
+                            .and_then(|s| parse_bili_live_time_to_unix_secs(1, s))
+                    })
+                })
+                .filter(|&t| t > 0)
+                .unwrap_or(now_ms / 1000);
+            meta.live_status = 1;
+            meta.start_time = Some(start_sec);
+            RoomMetaUpdate::LiveStarted {
+                start_time: start_sec,
+            }
+        }
+        "PREPARING" => {
+            let is_round = payload
+                .get("round")
+                .or_else(|| payload.get("data").and_then(|d| d.get("round")))
+                .and_then(value_as_u64)
+                == Some(1);
+            meta.live_status = if is_round { 2 } else { 0 };
+            meta.start_time = None;
+            RoomMetaUpdate::LiveStopped
+        }
+        "ROOM_CHANGE" => {
+            let data = payload.get("data").unwrap_or(payload);
+            if let Some(new_title) = data.get("title").and_then(non_empty_str) {
+                meta.title = new_title;
+            }
+            if let Some(area) = data.get("area_name").and_then(non_empty_str) {
+                meta.area_name = area;
+            }
+            if let Some(parent_area) = data.get("parent_area_name").and_then(non_empty_str) {
+                meta.parent_area_name = parent_area;
+            }
+            RoomMetaUpdate::InfoChanged
+        }
+        _ => RoomMetaUpdate::None,
+    }
+}
+
+/// Guard live stream event timestamps against zero or runaway future clock skew (> 60s ahead of `now_ms`).
+pub fn sanitize_live_timestamp(timestamp_ms: u64, now_ms: u64) -> u64 {
+    if timestamp_ms == 0 || timestamp_ms > now_ms.saturating_add(60_000) {
+        now_ms
+    } else {
+        timestamp_ms
+    }
+}
+
+const GUARD_DEDUP_CACHE_SIZE: usize = 256;
+
+/// Stateful per-session normalizer:
+/// assigns monotonic `seq`, caches & backfills avatars via LRU, skips `GUARD_BUY`
+/// (while warming avatar cache), and deduplicates `USER_TOAST_MSG(/V2)` by `payflow_id`.
+pub struct EventNormalizer {
+    seq: u64,
+    guard_payflow_cache: CLruCache<String, ()>,
+    avatar_cache: CLruCache<u64, String>,
+}
+
+impl EventNormalizer {
+    pub fn new(avatar_cache_size: usize) -> Self {
+        let avatar_cap = NonZeroUsize::new(avatar_cache_size.max(1)).expect("non-zero capacity");
+        let guard_cap = NonZeroUsize::new(GUARD_DEDUP_CACHE_SIZE).expect("non-zero capacity");
+        Self {
+            seq: 0,
+            guard_payflow_cache: CLruCache::new(guard_cap),
+            avatar_cache: CLruCache::new(avatar_cap),
+        }
+    }
+
+    pub fn current_seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn reset_session(&mut self) {
+        self.seq = 0;
+    }
+
+    pub fn next_seq(&mut self) -> u64 {
+        self.seq = self.seq.saturating_add(1);
+        self.seq
+    }
+
+    fn warm_or_backfill_avatar(&mut self, uid: u64, face: &mut Option<String>) {
+        if uid == 0 {
+            return;
+        }
+        if let Some(existing) = face.as_ref().filter(|s| !s.is_empty()) {
+            self.avatar_cache.put(uid, existing.clone());
+        } else if let Some(cached) = self.avatar_cache.get(&uid) {
+            *face = Some(cached.clone());
+        } else {
+            *face = None;
+        }
+    }
+
+    pub fn process_payload(
+        &mut self,
+        cmd: &str,
+        payload: &Value,
+        room_id: u64,
+        room_uname: &str,
+    ) -> Vec<RawBiliEvent> {
+        let raw_cmd = payload.get("cmd").and_then(|c| c.as_str()).unwrap_or(cmd);
+        let base_cmd = raw_cmd.split(':').next().unwrap_or(raw_cmd);
+
+        // Warm avatar cache from GUARD_BUY even though GUARD_BUY itself is skipped downstream
+        if base_cmd == "GUARD_BUY" {
+            if let Some(data) = payload.get("data") {
+                let mut temp = RawBiliEvent::default();
+                populate_user_from_data(data, &mut temp);
+                self.warm_or_backfill_avatar(temp.uid, &mut temp.face);
+            }
+            return Vec::new();
+        }
+
+        let events = parse_bili_cmd_events(cmd, payload, room_id, room_uname);
+        let mut out = Vec::with_capacity(events.len());
+        for mut ev in events {
+            self.warm_or_backfill_avatar(ev.uid, &mut ev.face);
+
+            if ev.kind == "guard" {
+                if !matches!(base_cmd, "USER_TOAST_MSG" | "USER_TOAST_MSG_V2")
+                    || ev.guard_level.unwrap_or(0) == 0
+                {
+                    continue;
+                }
+                if let Some(pf) = ev
+                    .payflow_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if self.guard_payflow_cache.get(pf).is_some() {
+                        continue;
+                    }
+                    self.guard_payflow_cache.put(pf.to_string(), ());
+                }
+            }
+
+            if ev.kind == "combo_end" {
+                ev.seq = 0;
+            } else {
+                ev.seq = self.next_seq();
+            }
+            out.push(ev);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1680,5 +2062,207 @@ mod tests {
         assert_eq!(rank.rank_type, "online_rank");
         assert!(!rank.online_list.is_empty());
         assert_eq!(rank.online_list[0].uname, "千面百性");
+    }
+
+    #[test]
+    fn test_http_response_parsers_and_room_meta_cmd() {
+        assert_eq!(
+            parse_master_info_uname(&json!({"code": 0, "data": {"info": {"uname": "  主播甲 "}}})),
+            Some("主播甲".to_string())
+        );
+        assert_eq!(parse_master_info_uname(&json!({"code": -1})), None);
+
+        let by_room = parse_get_info_by_room_json(
+            &json!({
+                "code": 0,
+                "data": {
+                    "room_info": {
+                        "room_id": 21465419,
+                        "short_id": 512,
+                        "uid": 88,
+                        "live_status": 1,
+                        "live_start_time": 1795219200,
+                        "title": "杂谈",
+                        "area_name": "虚拟日常",
+                        "parent_area_name": "虚拟主播"
+                    },
+                    "anchor_info": { "base_info": { "uname": "主播甲" } }
+                }
+            }),
+            512,
+        )
+        .unwrap();
+        assert_eq!(by_room.room_id, 21465419);
+        assert_eq!(by_room.uname, "主播甲");
+        assert_eq!(by_room.start_time, Some(1795219200));
+
+        let init_snap = parse_room_init_json(
+            &json!({
+                "code": 0,
+                "data": {
+                    "room_id": 21465419,
+                    "short_id": 512,
+                    "uid": 88,
+                    "live_status": 1,
+                    "live_time": 1795219200
+                }
+            }),
+            512,
+        )
+        .unwrap();
+        assert_eq!(init_snap.room_id, 21465419);
+        assert!(parse_room_init_json(&json!({"code": 60004, "message": "not found"}), 1).is_err());
+
+        assert_eq!(
+            parse_buvid3_spi_json(&json!({"data": {"b_3": " BUVID-123 "}})),
+            Some("BUVID-123".to_string())
+        );
+        assert_eq!(
+            parse_set_cookie_buvid3(&["buvid3=XYZ999; Path=/; Domain=.bilibili.com".to_string()]),
+            Some("XYZ999".to_string())
+        );
+
+        let qr = parse_qr_generate_response(&json!({
+            "code": 0,
+            "data": { "url": "https://passport.bilibili.com/qr", "qrcode_key": "k123" }
+        }))
+        .unwrap();
+        assert_eq!(qr.qrcode_key, "k123");
+
+        let my_room = parse_my_room_response(
+            &json!({
+                "code": 0,
+                "data": { "roomStatus": 1, "roomid": 9988, "title": "摸鱼", "liveStatus": 1 }
+            }),
+            "我自己",
+        )
+        .unwrap();
+        assert_eq!(my_room.room_id, 9988);
+        assert!(my_room.is_live);
+
+        let feed_list = parse_following_feed_list_response(&json!({
+            "code": 0,
+            "data": { "list": [{ "roomid": 1001, "uname": "A", "title": "开播" }] }
+        }))
+        .unwrap();
+        assert_eq!(feed_list.len(), 1);
+        assert_eq!(feed_list[0].room_id, 1001);
+
+        let following = parse_following_live_response(&json!({
+            "code": 0,
+            "data": { "list": [
+                { "roomid": 1001, "uname": "A", "title": "开播", "live_status": 1 },
+                { "roomid": 1002, "uname": "B", "title": "下播", "live_status": 0 }
+            ] }
+        }));
+        assert_eq!(following.len(), 1);
+        assert_eq!(following[0].room_id, 1001);
+
+        // apply_room_meta_cmd & sanitize_live_timestamp
+        let mut meta = by_room;
+        assert_eq!(
+            apply_room_meta_cmd(
+                &mut meta,
+                &json!({"cmd": "ROOM_CHANGE", "data": {"title": "新标题", "area_name": "唱歌"}}),
+                1_795_220_000_000,
+            ),
+            RoomMetaUpdate::InfoChanged
+        );
+        assert_eq!(meta.title, "新标题");
+        assert_eq!(meta.area_name, "唱歌");
+
+        assert_eq!(
+            apply_room_meta_cmd(
+                &mut meta,
+                &json!({"cmd": "PREPARING", "round": 1}),
+                1_795_220_005_000,
+            ),
+            RoomMetaUpdate::LiveStopped
+        );
+        assert_eq!(meta.live_status, 2);
+        assert_eq!(meta.start_time, None);
+
+        assert_eq!(
+            apply_room_meta_cmd(
+                &mut meta,
+                &json!({"cmd": "LIVE", "live_time": 1_795_220_010u64}),
+                1_795_220_010_000,
+            ),
+            RoomMetaUpdate::LiveStarted {
+                start_time: 1_795_220_010
+            }
+        );
+        assert_eq!(meta.live_status, 1);
+        assert_eq!(meta.start_time, Some(1_795_220_010));
+
+        assert_eq!(sanitize_live_timestamp(0, 100_000), 100_000);
+        assert_eq!(sanitize_live_timestamp(100_000 + 61_000, 100_000), 100_000);
+        assert_eq!(sanitize_live_timestamp(100_000 - 1_000, 100_000), 99_000);
+    }
+
+    #[test]
+    fn test_event_normalizer_seq_guard_dedup_and_avatar_backfill() {
+        let mut norm = EventNormalizer::new(64);
+        let guard_buy = json!({
+            "cmd": "GUARD_BUY",
+            "data": {
+                "uid": 31839477,
+                "username": "清风蓝云KUANG",
+                "guard_level": 3,
+                "num": 1,
+                "price": 198000,
+                "gift_name": "舰长",
+                "sender_uinfo": {
+                    "uid": 31839477,
+                    "base": { "face": "http://i0.hdslb.com/bfs/face/guard.jpg" }
+                }
+            }
+        });
+        assert!(
+            norm.process_payload("GUARD_BUY", &guard_buy, 21465419, "主播A")
+                .is_empty()
+        );
+        assert_eq!(norm.current_seq(), 0);
+
+        let toast = json!({
+            "cmd": "USER_TOAST_MSG",
+            "data": {
+                "uid": 31839477,
+                "username": "清风蓝云KUANG",
+                "guard_level": 3,
+                "num": 1,
+                "price": 168000,
+                "payflow_id": "pf-100",
+                "toast_msg": "在主播房间开通了舰长"
+            }
+        });
+        let out = norm.process_payload("USER_TOAST_MSG", &toast, 21465419, "主播A");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].seq, 1);
+        assert_eq!(
+            out[0].face.as_deref(),
+            Some("https://i0.hdslb.com/bfs/face/guard.jpg")
+        );
+
+        let dup = json!({
+            "cmd": "USER_TOAST_MSG_V2",
+            "data": {
+                "guard_info": { "uid": 31839477, "username": "清风蓝云KUANG", "guard_level": 3 },
+                "pay_info": { "num": 1, "price": 198000, "payflow_id": "pf-100" }
+            }
+        });
+        assert!(
+            norm.process_payload("USER_TOAST_MSG_V2", &dup, 21465419, "主播A")
+                .is_empty()
+        );
+        assert_eq!(norm.current_seq(), 1);
+
+        let combo = json!({
+            "cmd": "COMBO_SEND",
+            "data": { "uid": 777, "uname": "连击侠", "batch_combo_id": "b1" }
+        });
+        let out_combo = norm.process_payload("COMBO_SEND", &combo, 21465419, "主播A");
+        assert_eq!(out_combo[0].seq, 0);
+        assert_eq!(norm.current_seq(), 1);
     }
 }

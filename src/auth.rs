@@ -368,30 +368,62 @@ pub fn resolve_cookies(provided_cookie: Option<&str>) -> Result<String, String> 
     Err("No valid explicit cookies supplied".into())
 }
 
-pub fn init_uid(headers: HeaderMap) -> (StatusCode, String) {
-    let client = reqwest::blocking::Client::builder()
+fn build_blocking_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
         .https_only(true)
+        .timeout(std::time::Duration::from_secs(15))
         .build()
-        .unwrap();
+        .map_err(|e| format!("failed to build blocking HTTP client: {}", e))
+}
 
+/// Panic-free version of [`init_uid`] returning `Result<(StatusCode, String), String>`.
+pub fn try_init_uid(headers: HeaderMap) -> Result<(StatusCode, String), String> {
+    let client = build_blocking_client()?;
     let mut request_headers = headers;
-    request_headers.insert("user-agent", USER_AGENT.parse().unwrap());
+    let ua = reqwest::header::HeaderValue::from_static(USER_AGENT);
+    request_headers.insert(reqwest::header::USER_AGENT, ua);
 
-    let response = client.get(UID_INIT_URL).headers(request_headers).send();
-    log::debug!("init uid response: {:?}", response);
-    let stat: StatusCode;
-    let body: String;
-    match response {
-        Ok(resp) => {
-            stat = resp.status();
-            body = resp.text().unwrap();
-            log::info!("init uid response: {:?}", body);
-        }
-        Err(_) => {
-            panic!("init uid failed");
+    let resp = client
+        .get(UID_INIT_URL)
+        .headers(request_headers)
+        .send()
+        .map_err(|e| format!("init uid request failed: {}", e))?;
+    let stat = resp.status();
+    let body = resp
+        .text()
+        .map_err(|e| format!("init uid body read failed: {}", e))?;
+    log::info!("init uid response: {:?}", body);
+    Ok((stat, body))
+}
+
+pub fn init_uid(headers: HeaderMap) -> (StatusCode, String) {
+    try_init_uid(headers).unwrap_or_else(|e| panic!("{}", e))
+}
+
+/// Panic-free version of [`init_buvid`] returning `Result<(StatusCode, String), String>`.
+pub fn try_init_buvid(headers: HeaderMap) -> Result<(StatusCode, String), String> {
+    let client = build_blocking_client()?;
+    let mut request_headers = headers;
+    request_headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(USER_AGENT),
+    );
+
+    let resp = client
+        .get(BUVID_INIT_URL)
+        .headers(request_headers)
+        .send()
+        .map_err(|e| format!("init buvid request failed: {}", e))?;
+    let stat = resp.status();
+    let mut buvid = String::new();
+    for cookie in resp.cookies() {
+        log::debug!("init buvid response cookie : {:?}", cookie);
+        if cookie.name() == "buvid3" {
+            buvid = cookie.value().to_string();
+            log::info!("init buvid response: {:?}", buvid);
         }
     }
-    (stat, body)
+    Ok((stat, buvid))
 }
 
 /// Initializes the buvid by sending a request and extracting the 'buvid3' cookie.
@@ -400,37 +432,35 @@ pub fn init_uid(headers: HeaderMap) -> (StatusCode, String) {
 ///
 /// # Panics
 ///
-/// Panics if the request fails.
+/// Panics if the request fails. Prefer [`try_init_buvid`] for fallible error handling.
 pub fn init_buvid(headers: HeaderMap) -> (StatusCode, String) {
-    // Not used for document creation.
-    let client = reqwest::blocking::Client::builder()
-        .https_only(true)
-        .build()
-        .unwrap();
+    try_init_buvid(headers).unwrap_or_else(|e| panic!("{}", e))
+}
 
+/// Panic-free version of [`init_room`] returning `Result<(StatusCode, String), String>`.
+pub fn try_init_room(
+    headers: HeaderMap,
+    temp_room_id: &str,
+) -> Result<(StatusCode, String), String> {
+    let client = build_blocking_client()?;
     let mut request_headers = headers;
-    request_headers.insert("user-agent", USER_AGENT.parse().unwrap());
+    request_headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(USER_AGENT),
+    );
 
-    let response = client.get(BUVID_INIT_URL).headers(request_headers).send();
-    let stat: StatusCode;
-    let mut buvid: String = "".to_string();
-    match response {
-        Ok(resp) => {
-            stat = resp.status();
-            let cookies = resp.cookies();
-            for i in cookies {
-                log::debug!("init buvid response cookie : {:?}", i);
-                if "buvid3".eq(i.name()) {
-                    buvid = i.value().to_string();
-                    log::info!("init buvid response: {:?}", buvid);
-                }
-            }
-        }
-        Err(_) => {
-            panic!("init buvid failed");
-        }
-    }
-    (stat, buvid)
+    let url = format!("{}?room_id={}", ROOM_INIT_URL, temp_room_id);
+    let resp = client
+        .get(url)
+        .headers(request_headers)
+        .send()
+        .map_err(|e| format!("init room request failed: {}", e))?;
+    let stat = resp.status();
+    let body = resp
+        .text()
+        .map_err(|e| format!("init room body read failed: {}", e))?;
+    log::info!("init room response: {:?}", body);
+    Ok((stat, body))
 }
 
 /// Initializes the room by sending a request with the given room ID.
@@ -439,80 +469,47 @@ pub fn init_buvid(headers: HeaderMap) -> (StatusCode, String) {
 ///
 /// # Panics
 ///
-/// Panics if the request fails.
+/// Panics if the request fails. Prefer [`try_init_room`] for fallible error handling.
 pub fn init_room(headers: HeaderMap, temp_room_id: &str) -> (StatusCode, String) {
-    let client = reqwest::blocking::Client::builder()
-        .https_only(true)
-        .build()
-        .unwrap();
-
-    let mut request_headers = headers;
-    request_headers.insert("user-agent", USER_AGENT.parse().unwrap());
-
-    let url = format!("{}?room_id={}", ROOM_INIT_URL, temp_room_id);
-    let response = client.get(url).headers(request_headers).send();
-    let stat: StatusCode;
-    let body: String;
-    match response {
-        Ok(resp) => {
-            stat = resp.status();
-            body = resp.text().unwrap();
-            log::info!("init room response: {:?}", body);
-        }
-        Err(_) => {
-            panic!("init buvid failed");
-        }
-    }
-    (stat, body)
+    try_init_room(headers, temp_room_id).unwrap_or_else(|e| panic!("{}", e))
 }
 
-pub fn init_host_server(headers: HeaderMap, room_id: u64) -> (StatusCode, String) {
-    let client = reqwest::blocking::Client::builder()
-        .https_only(true)
-        .build()
-        .unwrap();
+/// Panic-free version of [`init_host_server`] returning `Result<(StatusCode, String), String>`.
+pub fn try_init_host_server(
+    headers: HeaderMap,
+    room_id: u64,
+) -> Result<(StatusCode, String), String> {
+    let client = build_blocking_client()?;
+    let mut request_headers = headers;
+    request_headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(USER_AGENT),
+    );
 
-    let mut request_headers = headers.clone();
-    request_headers.insert("user-agent", USER_AGENT.parse().unwrap());
-
-    // Get WBI keys for signing
-    let wbi_keys = match get_wbi_keys(request_headers.clone()) {
-        Ok(keys) => keys,
-        Err(e) => {
-            log::error!("Failed to get WBI keys: {:?}", e);
-            panic!("Failed to get WBI keys");
-        }
-    };
-
-    // Prepare parameters for signing
+    let wbi_keys = get_wbi_keys(request_headers.clone())?;
     let params = vec![
         ("id", room_id.to_string()),
         ("type", "0".to_string()),
         ("web_location", "444.8".to_string()),
     ];
-
-    // Generate signed query string
     let signed_query = encode_wbi(params, wbi_keys);
-
-    // Construct final URL
     let url = format!("{}?{}", DANMAKU_SERVER_CONF_URL, signed_query);
 
-    // debug log the total request
-    let response = client.get(url).headers(request_headers).send();
-    log::debug!("init host server response: {:?}", response);
-    let stat: StatusCode;
-    let body: String;
-    match response {
-        Ok(resp) => {
-            stat = resp.status();
-            body = resp.text().unwrap();
-            log::info!("init host server response body: {:?}", body);
-        }
-        Err(_) => {
-            panic!("init host server failed");
-        }
-    }
-    (stat, body)
+    let resp = client
+        .get(url)
+        .headers(request_headers)
+        .send()
+        .map_err(|e| format!("init host server request failed: {}", e))?;
+    let stat = resp.status();
+    let body = resp
+        .text()
+        .map_err(|e| format!("init host server body read failed: {}", e))?;
+    log::info!("init host server response body: {:?}", body);
+    Ok((stat, body))
+}
+
+pub fn init_host_server(headers: HeaderMap, room_id: u64) -> (StatusCode, String) {
+    try_init_host_server(headers, room_id).unwrap_or_else(|e| panic!("{}", e))
 }
 
 // WBI signing constants and functions
@@ -568,10 +565,10 @@ fn get_url_encoded(s: &str) -> String {
 
 // 为请求参数进行 wbi 签名
 fn encode_wbi(params: Vec<(&str, String)>, (img_key, sub_key): (String, String)) -> String {
-    let cur_time = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(t) => t.as_secs(),
-        Err(_) => panic!("SystemTime before UNIX EPOCH!"),
-    };
+    let cur_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|t| t.as_secs())
+        .unwrap_or(0);
     _encode_wbi(params, (img_key, sub_key), cur_time)
 }
 
@@ -597,25 +594,28 @@ fn _encode_wbi(
     query + &format!("&w_rid={}", web_sign)
 }
 
-fn get_wbi_keys(headers: HeaderMap) -> Result<(String, String), reqwest::Error> {
-    let client = reqwest::blocking::Client::builder()
-        .https_only(true)
-        .build()
-        .unwrap();
-
+fn get_wbi_keys(headers: HeaderMap) -> Result<(String, String), String> {
+    let client = build_blocking_client()?;
     let mut request_headers = headers;
-    request_headers.insert("user-agent", USER_AGENT.parse().unwrap());
+    request_headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(USER_AGENT),
+    );
 
     let response = client
-        .get("https://api.bilibili.com/x/web-interface/nav")
+        .get(UID_INIT_URL)
         .headers(request_headers)
-        .send()?;
+        .send()
+        .map_err(|e| format!("WBI nav request failed: {}", e))?;
 
-    let res_wbi: ResWbi = response.json()?;
-    Ok((
-        take_filename(res_wbi.data.wbi_img.img_url).unwrap(),
-        take_filename(res_wbi.data.wbi_img.sub_url).unwrap(),
-    ))
+    let res_wbi: ResWbi = response
+        .json()
+        .map_err(|e| format!("WBI nav JSON decode failed: {}", e))?;
+    let img_key = take_filename(res_wbi.data.wbi_img.img_url)
+        .ok_or_else(|| "WBI img_url missing key filename".to_string())?;
+    let sub_key = take_filename(res_wbi.data.wbi_img.sub_url)
+        .ok_or_else(|| "WBI sub_url missing key filename".to_string())?;
+    Ok((img_key, sub_key))
 }
 
 fn take_filename(url: String) -> Option<String> {

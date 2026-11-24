@@ -1,5 +1,6 @@
 //! Bilibili live room danmaku WebSocket, Protobuf, command, and authentication protocol library.
 
+pub mod api;
 pub mod auth;
 pub mod commands;
 pub mod models;

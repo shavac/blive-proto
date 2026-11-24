@@ -4,9 +4,10 @@ Bilibili live room danmaku WebSocket, Protobuf, command, and authentication prot
 
 ## Features
 
-- **WebSocket Framing & Decompression** (`websocket`): Parse Bilibili live binary frames (plain JSON, Zlib `ver=2`, Brotli `ver=3`) cleanly via `decode_bili_frames`, plus standalone synchronous `BiliLiveClient` helpers.
+- **Async Bilibili REST Client** (`api::BiliApiClient`): Encapsulates QR login generate/poll, session validation (`nav` + live user-info fallback), danmaku sending (`/msg/send`), user/following live room queries, room metadata resolution (`get_info` / `getInfoByRoom` / `room_init`), `buvid3` resolution, and active SuperChat seeding.
+- **WebSocket Framing, Handshake & Managed Session** (`websocket`): Panic-free binary frame decoder (`decode_bili_frames`: plain JSON, Zlib `ver=2`, Brotli `ver=3`), managed blocking `LiveWsSession` (buvid3 fallback, WBI `getDanmuInfo`, `protover=3` AUTH, 30s HEARTBEAT), plus standalone `BiliLiveClient` helpers.
 - **Schema-Driven Protobuf Decoding** (`pb`): Compile-time code generation from [`proto/event.proto`](proto/event.proto) via `prost-build` and `protoc-bin-vendored` (no system `protoc` installation required), supporting `INTERACT_WORD_V2`, `SEND_GIFT_V2`, `ONLINE_RANK_V2`/`V3`, and `DANMU_MSG` `dm_v2`, plus `enrich_raw_json_with_pb_decoded`.
-- **Stateless Command & Metadata Parsers** (`commands`): Normalize room metadata (`parse_room_get_info_json`), active SuperChats (`parse_active_super_chats_json`), room ID extraction (`parse_room_input`), and live events (`parse_bili_cmd_events` -> `Vec<RawBiliEvent>`).
+- **Stateless Parsers & Stateful Normalizer** (`commands`): Room metadata/REST response parsers, `apply_room_meta_cmd`, `parse_bili_cmd_events` -> `Vec<RawBiliEvent>`, and `EventNormalizer` (monotonic `seq`, LRU avatar backfill, `GUARD_BUY` dedup, `payflow_id` dedup).
 - **Auth & Danmaku Send Protocol Helpers** (`auth`): Session cookie validation/parsing (`SessionData`), WBI parameter signing, QR login polling response parsers (`QrPollStatus`), and danmaku send response handling (`SendDanmakuError`).
 
 ## Installation

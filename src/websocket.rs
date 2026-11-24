@@ -5,20 +5,19 @@ use base64::{Engine as _, engine::general_purpose};
 use flate2::read::ZlibDecoder;
 use native_tls::TlsStream;
 use serde_json::Value;
-use std::io::Read as _;
+use std::io::{ErrorKind, Read as _};
 use std::net::TcpStream;
-use std::panic;
+use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket, client};
 
 use url::Url;
 
 use futures_channel::mpsc::Sender;
 use http::Response;
-use std::collections::HashMap;
 use std::thread;
-use std::time::Duration;
 
 use crate::auth::*;
+use crate::commands::append_cookie_kv;
 use crate::models::{AuthMessage, BiliMessage, DanmuServer, MsgHead};
 
 pub struct BiliLiveClient {
@@ -158,14 +157,11 @@ impl BiliLiveClient {
         cookies: &str,
         room_id: &str,
     ) -> Result<(WebSocket<TlsStream<TcpStream>>, String), String> {
-        panic::catch_unwind(|| {
-            let (v, auth) = init_server(cookies, room_id);
-            let (ws, _res) = connect_result(v["host_list"].clone())?;
-            let auth_msg = serde_json::to_string(&auth)
-                .map_err(|e| format!("serialize auth payload failed: {}", e))?;
-            Ok((ws, auth_msg))
-        })
-        .map_err(|_| format!("websocket setup panicked for room {}", room_id))?
+        let (v, auth) = try_init_server(cookies, room_id)?;
+        let (ws, _res) = connect_result(v["host_list"].clone())?;
+        let auth_msg = serde_json::to_string(&auth)
+            .map_err(|e| format!("serialize auth payload failed: {}", e))?;
+        Ok((ws, auth_msg))
     }
 
     fn send_auth_internal(&mut self) -> Result<(), String> {
@@ -282,47 +278,58 @@ impl BiliLiveClient {
 }
 
 pub fn gen_damu_list(list: &Value) -> Vec<DanmuServer> {
-    let server_list = list.as_array().unwrap();
     let mut res: Vec<DanmuServer> = Vec::new();
-    if server_list.is_empty() {
-        let d = DanmuServer::default();
-        res.push(d);
+    if let Some(server_list) = list.as_array() {
+        for s in server_list {
+            let Some(host) = s["host"].as_str().filter(|h| !h.trim().is_empty()) else {
+                continue;
+            };
+            let port = s["port"].as_u64().unwrap_or(2243) as i32;
+            let wss_port = s["wss_port"].as_u64().unwrap_or(443) as i32;
+            let ws_port = s["ws_port"].as_u64().unwrap_or(2244) as i32;
+            res.push(DanmuServer {
+                host: host.to_string(),
+                port,
+                wss_port,
+                ws_port,
+            });
+        }
     }
-    for s in server_list {
-        res.push(DanmuServer {
-            host: s["host"].as_str().unwrap().to_string(),
-            port: s["port"].as_u64().unwrap() as i32,
-            wss_port: s["wss_port"].as_u64().unwrap() as i32,
-            ws_port: s["ws_port"].as_u64().unwrap() as i32,
-        });
+    if res.is_empty() {
+        res.push(DanmuServer::default());
     }
     res
 }
 
 fn find_server(vd: Vec<DanmuServer>) -> (String, String, String) {
-    let first = vd.first().unwrap();
-    let (host, wss_port) = (first.host.clone(), first.wss_port);
+    let first = vd.into_iter().next().unwrap_or_default();
+    let (host, wss_port) = (first.host, first.wss_port);
     (
         host.clone(),
-        format!("{}:{}", host.clone(), wss_port),
+        format!("{}:{}", host, wss_port),
         format!("wss://{}:{}/sub", host, wss_port),
     )
 }
 
-pub fn init_server(cookies: &str, room_id: &str) -> (Value, AuthMessage) {
-    let mut auth_map = HashMap::new();
+/// Panic-free version of [`init_server`] returning `Result<(Value, AuthMessage), String>`.
+pub fn try_init_server(cookies: &str, room_id: &str) -> Result<(Value, AuthMessage), String> {
+    let room_id_num = room_id
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("invalid room_id '{}': expected unsigned integer", room_id))?;
+
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::COOKIE,
-        reqwest::header::HeaderValue::from_str(cookies).unwrap(),
-    );
+    if !cookies.trim().is_empty() {
+        let cookie_val = reqwest::header::HeaderValue::from_str(cookies)
+            .map_err(|e| format!("invalid Cookie header value: {}", e))?;
+        headers.insert(reqwest::header::COOKIE, cookie_val);
+    }
     headers.insert(
         reqwest::header::USER_AGENT,
         reqwest::header::HeaderValue::from_static(crate::auth::USER_AGENT),
     );
     log::debug!("headers: {:?}", headers);
 
-    // Extract SESSDATA from cookies for authentication
     let sessdata = cookies
         .split(';')
         .find_map(|kv| {
@@ -335,36 +342,60 @@ pub fn init_server(cookies: &str, room_id: &str) -> (Value, AuthMessage) {
                 None
             }
         })
-        .unwrap_or_else(|| "".to_string());
+        .unwrap_or_default();
 
-    if !sessdata.is_empty() {
-        let (_, body1) = init_uid(headers.clone());
-        let body1_v: Value = serde_json::from_str(body1.as_str()).unwrap();
+    let uid = if !sessdata.is_empty() {
+        let (_, body1) = try_init_uid(headers.clone())?;
+        let body1_v: Value = serde_json::from_str(&body1)
+            .map_err(|e| format!("failed to parse nav UID response JSON: {}", e))?;
 
-        // Check if the authentication was successful
-        if let Some(mid) = body1_v["data"]["mid"].as_i64() {
-            auth_map.insert("uid".to_string(), mid.to_string());
+        if let Some(mid) = body1_v["data"]["mid"].as_u64().or_else(|| {
+            body1_v["data"]["mid"]
+                .as_i64()
+                .filter(|&m| m >= 0)
+                .map(|m| m as u64)
+        }) {
             log::info!("Successfully authenticated with uid: {}", mid);
+            mid
         } else {
             log::warn!("Authentication failed - SESSDATA may be invalid or expired");
             log::debug!("Auth response: {}", body1);
-            auth_map.insert("uid".to_string(), "0".to_string());
+            0
         }
     } else {
-        auth_map.insert("uid".to_string(), "0".to_string());
+        0
+    };
+
+    let (_, body4) = try_init_host_server(headers, room_id_num)?;
+    let body4_res: Value = serde_json::from_str(&body4)
+        .map_err(|e| format!("failed to parse getDanmuInfo response JSON: {}", e))?;
+    let code = body4_res["code"].as_i64().unwrap_or(-1);
+    if code != 0 {
+        return Err(format!(
+            "getDanmuInfo API failed (code {}): {}",
+            code,
+            body4_res["message"].as_str().unwrap_or("unknown")
+        ));
     }
-    // here the live room id is easily obtained, so we not get it by url.
-    auth_map.insert("room_id".to_string(), room_id.to_string());
-
-    let room_id_num = room_id.parse::<u64>().expect("room_id must be a valid u64");
-    let (_, body4) = init_host_server(headers.clone(), room_id_num);
-    let body4_res: Value = serde_json::from_str(body4.as_str()).unwrap();
     let server_info = &body4_res["data"];
-    let token = &body4_res["data"]["token"].as_str().unwrap();
-    auth_map.insert("token".to_string(), token.to_string());
+    let token = server_info["token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "getDanmuInfo response missing data.token".to_string())?;
 
-    let auth_msg = AuthMessage::from(&auth_map);
-    (server_info.clone(), auth_msg)
+    let auth_msg = AuthMessage {
+        uid,
+        roomid: room_id_num,
+        protover: 3,
+        platform: "web".to_string(),
+        type_: 2,
+        key: token.to_string(),
+    };
+    Ok((server_info.clone(), auth_msg))
+}
+
+pub fn init_server(cookies: &str, room_id: &str) -> (Value, AuthMessage) {
+    try_init_server(cookies, room_id).unwrap_or_else(|e| panic!("{}", e))
 }
 
 pub fn connect(v: Value) -> (WebSocket<TlsStream<TcpStream>>, Response<Option<Vec<u8>>>) {
@@ -394,10 +425,11 @@ pub enum Operation {
 }
 
 pub fn make_packet(body: &str, ops: Operation) -> Vec<u8> {
-    let json: Value = serde_json::from_str(body).unwrap();
-    let temp = json.to_string();
-    let body_content: &[u8] = temp.as_bytes();
-    let pack_len: [u8; 4] = ((16 + body.len()) as u32).to_be_bytes();
+    let serialized = serde_json::from_str::<Value>(body)
+        .map(|json| json.to_string())
+        .unwrap_or_else(|_| body.to_string());
+    let body_content = serialized.as_bytes();
+    let pack_len: [u8; 4] = ((16 + body_content.len()) as u32).to_be_bytes();
     let raw_header_size: [u8; 2] = 16_u16.to_be_bytes();
     let ver: [u8; 2] = 1_u16.to_be_bytes();
     let operation: [u8; 4] = match ops {
@@ -405,12 +437,13 @@ pub fn make_packet(body: &str, ops: Operation) -> Vec<u8> {
         Operation::HEARTBEAT => 2_u32.to_be_bytes(),
     };
     let seq_id: [u8; 4] = 1_u32.to_be_bytes();
-    let mut res = pack_len.to_vec();
-    res.append(&mut raw_header_size.to_vec());
-    res.append(&mut ver.to_vec());
-    res.append(&mut operation.to_vec());
-    res.append(&mut seq_id.to_vec());
-    res.append(&mut body_content.to_vec());
+    let mut res = Vec::with_capacity(16 + body_content.len());
+    res.extend_from_slice(&pack_len);
+    res.extend_from_slice(&raw_header_size);
+    res.extend_from_slice(&ver);
+    res.extend_from_slice(&operation);
+    res.extend_from_slice(&seq_id);
+    res.extend_from_slice(body_content);
     res
 }
 
@@ -598,8 +631,153 @@ pub fn init_server_auto(
 
     log::info!("Using resolved cookies for authentication");
 
-    let result = init_server(&cookies, room_id);
-    Ok(result)
+    try_init_server(&cookies, room_id)
+}
+
+/// Outcome of polling a managed [`LiveWsSession`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveWsPoll {
+    /// Decoded one or more JSON command packets into `out_jsons` (or processed a control frame).
+    Packets,
+    /// Socket read timed out without new frames; caller may check cancellation and poll again.
+    Timeout,
+    /// Remote peer closed the WebSocket connection cleanly.
+    Closed,
+}
+
+/// Managed blocking Bilibili live WebSocket session encapsulating `buvid3` fallback,
+/// WBI `getDanmuInfo` handshake, `protover=3` AUTH, 30-second HEARTBEAT, and binary frame decoding.
+pub struct LiveWsSession {
+    ws: WebSocket<TlsStream<TcpStream>>,
+    last_heartbeat: Instant,
+    has_buvid: bool,
+}
+
+impl LiveWsSession {
+    /// Connect and authenticate to `room_id` without a cancellation predicate.
+    pub fn connect(
+        room_id: u64,
+        cookie_str: &str,
+        buvid3: &str,
+        read_timeout: Duration,
+    ) -> Result<Self, String> {
+        Self::connect_with_cancel(room_id, cookie_str, buvid3, read_timeout, || false)?
+            .ok_or_else(|| "connection cancelled".to_string())
+    }
+
+    /// Connect and authenticate to `room_id`, checking `is_cancelled()` between blocking handshake steps.
+    /// Returns `Ok(None)` when cancelled cleanly before completing the handshake.
+    pub fn connect_with_cancel<F>(
+        room_id: u64,
+        cookie_str: &str,
+        buvid3: &str,
+        read_timeout: Duration,
+        is_cancelled: F,
+    ) -> Result<Option<Self>, String>
+    where
+        F: Fn() -> bool,
+    {
+        let room_id_str = room_id.to_string();
+        let resolved_buvid = if buvid3.trim().is_empty() {
+            try_init_buvid(Default::default())
+                .ok()
+                .map(|(_, b)| b.trim().to_string())
+                .unwrap_or_default()
+        } else {
+            buvid3.trim().to_string()
+        };
+        let effective_cookie = append_cookie_kv(cookie_str, "buvid3", &resolved_buvid);
+        if is_cancelled() {
+            return Ok(None);
+        }
+
+        let (server_info, auth_msg) = try_init_server(&effective_cookie, &room_id_str)?;
+
+        if is_cancelled() {
+            return Ok(None);
+        }
+
+        let (mut ws, _resp) = connect_result(server_info["host_list"].clone())
+            .map_err(|e| format!("WS connect failed: {}", e))?;
+
+        if is_cancelled() {
+            let _ = ws.close(None);
+            return Ok(None);
+        }
+
+        if let Err(e) = ws.get_ref().get_ref().set_read_timeout(Some(read_timeout)) {
+            log::warn!("Failed to set read timeout on Bilibili WS socket: {}", e);
+        }
+
+        let mut auth_payload = serde_json::json!({
+            "uid": auth_msg.uid,
+            "roomid": auth_msg.roomid,
+            "protover": 3,
+            "platform": "web",
+            "type": 2,
+            "key": auth_msg.key,
+        });
+        if !resolved_buvid.is_empty()
+            && let Some(obj) = auth_payload.as_object_mut()
+        {
+            obj.insert("buvid".to_string(), Value::String(resolved_buvid.clone()));
+        }
+        let auth_json = auth_payload.to_string();
+
+        ws.send(Message::Binary(make_packet(&auth_json, Operation::AUTH)))
+            .map_err(|e| format!("Send AUTH failed: {}", e))?;
+
+        ws.send(Message::Binary(make_packet("{}", Operation::HEARTBEAT)))
+            .map_err(|e| format!("Send initial HEARTBEAT failed: {}", e))?;
+
+        Ok(Some(Self {
+            ws,
+            last_heartbeat: Instant::now(),
+            has_buvid: !resolved_buvid.is_empty(),
+        }))
+    }
+
+    /// Whether a non-empty `buvid3` token was included in the WebSocket AUTH handshake.
+    pub fn has_buvid(&self) -> bool {
+        self.has_buvid
+    }
+
+    /// Maintain the 30-second heartbeat and read the next frame into `out_jsons`.
+    pub fn poll_next(&mut self, out_jsons: &mut Vec<Value>) -> Result<LiveWsPoll, String> {
+        out_jsons.clear();
+        if self.last_heartbeat.elapsed() >= Duration::from_secs(30) {
+            self.ws
+                .send(Message::Binary(make_packet("{}", Operation::HEARTBEAT)))
+                .map_err(|e| format!("Send HEARTBEAT failed: {}", e))?;
+            self.last_heartbeat = Instant::now();
+        }
+
+        match self.ws.read() {
+            Ok(Message::Binary(bytes)) => {
+                let res = decode_bili_frames(&bytes, out_jsons);
+                if res.auth_ack {
+                    let _ = self
+                        .ws
+                        .send(Message::Binary(make_packet("{}", Operation::HEARTBEAT)));
+                    self.last_heartbeat = Instant::now();
+                }
+                Ok(LiveWsPoll::Packets)
+            }
+            Ok(Message::Close(_)) => Ok(LiveWsPoll::Closed),
+            Ok(_) => Ok(LiveWsPoll::Timeout),
+            Err(tungstenite::Error::Io(ref e))
+                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                Ok(LiveWsPoll::Timeout)
+            }
+            Err(e) => Err(format!("WS read error: {}", e)),
+        }
+    }
+
+    /// Gracefully close the underlying WebSocket stream.
+    pub fn close(&mut self) {
+        let _ = self.ws.close(None);
+    }
 }
 
 #[cfg(test)]
@@ -608,6 +786,7 @@ mod tests {
     use futures_channel::mpsc::channel;
 
     #[test]
+    #[ignore = "requires live network access to Bilibili"]
     fn test_bili_live_client_connect() {
         // Get cookies from environment variable for real test
         let cookies =
@@ -615,6 +794,24 @@ mod tests {
         let room_id = "24779526";
         let (tx, _rx) = channel(10);
         let _client = BiliLiveClient::new(&cookies, room_id, tx);
+    }
+
+    #[test]
+    fn test_make_packet_gen_damu_list_and_try_init_server_validation() {
+        // Whitespace JSON must compute pack_len from actual serialized bytes, not input len
+        let pkt = make_packet("{ \"uid\": 123 }", Operation::AUTH);
+        let head = get_msg_header(&pkt[..16]);
+        assert_eq!(head.pack_len as usize, pkt.len());
+        assert_eq!(head.operation, 7);
+
+        // Non-array or empty host_list gracefully falls back to default server without panicking
+        let fallback = gen_damu_list(&serde_json::json!(null));
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].host, DanmuServer::default().host);
+
+        // Invalid room_id / invalid header returns Err without panicking
+        assert!(try_init_server("", "not-a-number").is_err());
+        assert!(try_init_server("bad\ncookie", "24779526").is_err());
     }
 
     fn build_raw_frame(ver: u16, op: u32, body: &[u8]) -> Vec<u8> {

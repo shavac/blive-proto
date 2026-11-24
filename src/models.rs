@@ -199,6 +199,31 @@ pub struct AuthState {
     pub face: String,
 }
 
+/// Room summary item returned by user room & following-live Bilibili APIs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomQuickItem {
+    pub room_id: u64,
+    pub room_uname: String,
+    pub title: String,
+    pub is_live: bool,
+}
+
+/// Raw QR login payload returned by `passport.bilibili.com/x/passport-login/web/qrcode/generate`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QrCodeInfo {
+    pub url: String,
+    pub qrcode_key: String,
+}
+
+/// Incremental room metadata change produced by live lifecycle packets (`LIVE`, `PREPARING`, `ROOM_CHANGE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomMetaUpdate {
+    None,
+    LiveStarted { start_time: u64 },
+    LiveStopped,
+    InfoChanged,
+}
+
 #[derive(Debug)]
 pub struct DanmuServer {
     pub host: String,
