@@ -1,8 +1,7 @@
-// src/auth.rs
 //! Authentication helpers for Bilibili live danmaku WebSocket client
 
+use crate::commands::{extract_cookie_value, value_as_u64};
 use crate::models::AuthState;
-use md5;
 use reqwest::StatusCode;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -32,12 +31,6 @@ fn percent_decode(input: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).to_string()
-}
-
-fn value_as_u64(v: &Value) -> Option<u64> {
-    v.as_u64()
-        .or_else(|| v.as_i64().filter(|&n| n >= 0).map(|n| n as u64))
-        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
 }
 
 /// Bilibili session cookies (`SESSDATA`, `bili_jct`, `DedeUserID`) and cached profile metadata.
@@ -71,70 +64,38 @@ impl SessionData {
         )
     }
 
+    fn set_cookie_field(&mut self, key: &str, value: String) {
+        match key.trim() {
+            "SESSDATA" => self.sessdata = value,
+            "bili_jct" => self.bili_jct = value,
+            "DedeUserID" => self.dede_user_id = value,
+            _ => {}
+        }
+    }
+
     /// Extract SESSDATA, bili_jct, and DedeUserID from HTTP `Set-Cookie` header values.
     pub fn from_set_cookie_headers(headers: &[String]) -> Option<Self> {
-        let mut sessdata = String::new();
-        let mut bili_jct = String::new();
-        let mut dede_user_id = String::new();
-
+        let mut session = Self::default();
         for h in headers {
             if let Some(kv) = h.split(';').next()
                 && let Some((k, v)) = kv.split_once('=')
             {
-                match k.trim() {
-                    "SESSDATA" => sessdata = v.trim().to_string(),
-                    "bili_jct" => bili_jct = v.trim().to_string(),
-                    "DedeUserID" => dede_user_id = v.trim().to_string(),
-                    _ => {}
-                }
+                session.set_cookie_field(k, v.trim().to_string());
             }
         }
-
-        let session = Self {
-            sessdata,
-            bili_jct,
-            dede_user_id,
-            uname: String::new(),
-            face: String::new(),
-        };
-        if session.is_valid_format() {
-            Some(session)
-        } else {
-            None
-        }
+        session.is_valid_format().then_some(session)
     }
 
     /// Fallback extractor parsing `SESSDATA`, `bili_jct`, `DedeUserID` from QR poll `data.url` query params.
     pub fn from_login_url(url: &str) -> Option<Self> {
         let (_, query) = url.split_once('?')?;
-        let mut sessdata = String::new();
-        let mut bili_jct = String::new();
-        let mut dede_user_id = String::new();
-
+        let mut session = Self::default();
         for pair in query.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
-                let decoded = percent_decode(v.trim());
-                match k.trim() {
-                    "SESSDATA" => sessdata = decoded,
-                    "bili_jct" => bili_jct = decoded,
-                    "DedeUserID" => dede_user_id = decoded,
-                    _ => {}
-                }
+                session.set_cookie_field(k, percent_decode(v.trim()));
             }
         }
-
-        let session = Self {
-            sessdata,
-            bili_jct,
-            dede_user_id,
-            uname: String::new(),
-            face: String::new(),
-        };
-        if session.is_valid_format() {
-            Some(session)
-        } else {
-            None
-        }
+        session.is_valid_format().then_some(session)
     }
 }
 
@@ -155,17 +116,14 @@ pub fn parse_qr_poll_response(
     fallback_url: Option<&str>,
 ) -> QrPollStatus {
     match code {
-        0 => {
-            if let Some(session) = SessionData::from_set_cookie_headers(set_cookies)
-                .or_else(|| fallback_url.and_then(SessionData::from_login_url))
-            {
-                QrPollStatus::Success(session)
-            } else {
+        0 => SessionData::from_set_cookie_headers(set_cookies)
+            .or_else(|| fallback_url.and_then(SessionData::from_login_url))
+            .map(QrPollStatus::Success)
+            .unwrap_or_else(|| {
                 QrPollStatus::Error(
                     "Missing SESSDATA/bili_jct/DedeUserID in Set-Cookie and login URL".to_string(),
                 )
-            }
-        }
+            }),
         86101 => QrPollStatus::Waiting,
         86090 => QrPollStatus::Scanned,
         86038 => QrPollStatus::Expired,
@@ -177,30 +135,26 @@ pub fn parse_qr_poll_code(code: i64, message: &str, set_cookies: &[String]) -> Q
     parse_qr_poll_response(code, message, set_cookies, None)
 }
 
+fn parse_auth_profile(data: &Value, id_key: &str, fallback_mid: u64) -> Option<AuthState> {
+    let uname = data["uname"].as_str().unwrap_or("").trim().to_string();
+    if uname.is_empty() {
+        return None;
+    }
+    Some(AuthState {
+        is_login: true,
+        uname,
+        mid: value_as_u64(&data[id_key]).unwrap_or(fallback_mid),
+        face: data["face"].as_str().unwrap_or("").trim().to_string(),
+    })
+}
+
 /// Parses `https://api.bilibili.com/x/web-interface/nav` JSON into an `AuthState`.
 /// Returns `None` on transient/risk-control errors (e.g. `-412`) so fallback APIs can run.
 pub fn parse_nav_response(resp: &Value, fallback_mid: u64) -> Option<AuthState> {
     let code = resp["code"].as_i64().unwrap_or(-1);
     let is_login = resp["data"]["isLogin"].as_bool();
     if code == 0 && is_login == Some(true) {
-        let uname = resp["data"]["uname"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if uname.is_empty() {
-            return None;
-        }
-        return Some(AuthState {
-            is_login: true,
-            uname,
-            mid: value_as_u64(&resp["data"]["mid"]).unwrap_or(fallback_mid),
-            face: resp["data"]["face"]
-                .as_str()
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-        });
+        return parse_auth_profile(&resp["data"], "mid", fallback_mid);
     }
     if code == -101 || (code == 0 && is_login == Some(false)) {
         return Some(AuthState::default());
@@ -211,24 +165,11 @@ pub fn parse_nav_response(resp: &Value, fallback_mid: u64) -> Option<AuthState> 
 /// Parses `https://api.live.bilibili.com/xlive/web-ucenter/user/get_user_info` JSON into an `AuthState`.
 /// Returns `None` on transient/risk-control errors so cached auth state is preserved.
 pub fn parse_live_user_info_response(resp: &Value, fallback_mid: u64) -> Option<AuthState> {
-    let code = resp["code"].as_i64().unwrap_or(-1);
-    if code == 0 {
-        let data = &resp["data"];
-        let uname = data["uname"].as_str().unwrap_or("").trim().to_string();
-        if uname.is_empty() {
-            return None;
-        }
-        return Some(AuthState {
-            is_login: true,
-            uname,
-            mid: value_as_u64(&data["uid"]).unwrap_or(fallback_mid),
-            face: data["face"].as_str().unwrap_or("").trim().to_string(),
-        });
+    match resp["code"].as_i64().unwrap_or(-1) {
+        0 => parse_auth_profile(&resp["data"], "uid", fallback_mid),
+        -101 => Some(AuthState::default()),
+        _ => None,
     }
-    if code == -101 {
-        return Some(AuthState::default());
-    }
-    None
 }
 
 /// Maximum character count allowed per sent Bilibili live danmaku message.
@@ -357,10 +298,7 @@ pub fn parse_send_danmaku_response(resp: &Value) -> Result<(), SendDanmakuError>
 /// Validate explicit Bilibili cookies and fail with a clear error when missing.
 pub fn resolve_cookies(provided_cookie: Option<&str>) -> Result<String, String> {
     if let Some(cookie) = provided_cookie
-        && cookie.split(';').map(str::trim).any(|part| {
-            part.strip_prefix("SESSDATA=")
-                .is_some_and(|value| !value.is_empty() && value != "dummy_sessdata")
-        })
+        && extract_cookie_value(cookie, "SESSDATA").is_some_and(|v| v != "dummy_sessdata")
     {
         log::info!("Using provided Bilibili cookies");
         return Ok(cookie.to_string());
@@ -368,32 +306,44 @@ pub fn resolve_cookies(provided_cookie: Option<&str>) -> Result<String, String> 
     Err("No valid explicit cookies supplied".into())
 }
 
-fn build_blocking_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
+fn blocking_get(
+    url: &str,
+    mut headers: HeaderMap,
+    label: &str,
+) -> Result<reqwest::blocking::Response, String> {
+    let client = reqwest::blocking::Client::builder()
         .https_only(true)
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .map_err(|e| format!("failed to build blocking HTTP client: {}", e))
+        .map_err(|e| format!("failed to build blocking HTTP client: {}", e))?;
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(USER_AGENT),
+    );
+    client
+        .get(url)
+        .headers(headers)
+        .send()
+        .map_err(|e| format!("{} request failed: {}", label, e))
+}
+
+fn blocking_get_text(
+    url: &str,
+    headers: HeaderMap,
+    label: &str,
+) -> Result<(StatusCode, String), String> {
+    let resp = blocking_get(url, headers, label)?;
+    let stat = resp.status();
+    let body = resp
+        .text()
+        .map_err(|e| format!("{} body read failed: {}", label, e))?;
+    log::info!("{} response: {:?}", label, body);
+    Ok((stat, body))
 }
 
 /// Panic-free version of [`init_uid`] returning `Result<(StatusCode, String), String>`.
 pub fn try_init_uid(headers: HeaderMap) -> Result<(StatusCode, String), String> {
-    let client = build_blocking_client()?;
-    let mut request_headers = headers;
-    let ua = reqwest::header::HeaderValue::from_static(USER_AGENT);
-    request_headers.insert(reqwest::header::USER_AGENT, ua);
-
-    let resp = client
-        .get(UID_INIT_URL)
-        .headers(request_headers)
-        .send()
-        .map_err(|e| format!("init uid request failed: {}", e))?;
-    let stat = resp.status();
-    let body = resp
-        .text()
-        .map_err(|e| format!("init uid body read failed: {}", e))?;
-    log::info!("init uid response: {:?}", body);
-    Ok((stat, body))
+    blocking_get_text(UID_INIT_URL, headers, "init uid")
 }
 
 pub fn init_uid(headers: HeaderMap) -> (StatusCode, String) {
@@ -402,18 +352,7 @@ pub fn init_uid(headers: HeaderMap) -> (StatusCode, String) {
 
 /// Panic-free version of [`init_buvid`] returning `Result<(StatusCode, String), String>`.
 pub fn try_init_buvid(headers: HeaderMap) -> Result<(StatusCode, String), String> {
-    let client = build_blocking_client()?;
-    let mut request_headers = headers;
-    request_headers.insert(
-        reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static(USER_AGENT),
-    );
-
-    let resp = client
-        .get(BUVID_INIT_URL)
-        .headers(request_headers)
-        .send()
-        .map_err(|e| format!("init buvid request failed: {}", e))?;
+    let resp = blocking_get(BUVID_INIT_URL, headers, "init buvid")?;
     let stat = resp.status();
     let mut buvid = String::new();
     for cookie in resp.cookies() {
@@ -426,9 +365,7 @@ pub fn try_init_buvid(headers: HeaderMap) -> Result<(StatusCode, String), String
     Ok((stat, buvid))
 }
 
-/// Initializes the buvid by sending a request and extracting the 'buvid3' cookie.
-///
-/// Note: This function is not used for document creation.
+/// Initializes the buvid by sending a request and extracting the `buvid3` cookie.
 ///
 /// # Panics
 ///
@@ -442,30 +379,11 @@ pub fn try_init_room(
     headers: HeaderMap,
     temp_room_id: &str,
 ) -> Result<(StatusCode, String), String> {
-    let client = build_blocking_client()?;
-    let mut request_headers = headers;
-    request_headers.insert(
-        reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static(USER_AGENT),
-    );
-
     let url = format!("{}?room_id={}", ROOM_INIT_URL, temp_room_id);
-    let resp = client
-        .get(url)
-        .headers(request_headers)
-        .send()
-        .map_err(|e| format!("init room request failed: {}", e))?;
-    let stat = resp.status();
-    let body = resp
-        .text()
-        .map_err(|e| format!("init room body read failed: {}", e))?;
-    log::info!("init room response: {:?}", body);
-    Ok((stat, body))
+    blocking_get_text(&url, headers, "init room")
 }
 
 /// Initializes the room by sending a request with the given room ID.
-///
-/// Note: This function should NOT be used for document creation.
 ///
 /// # Panics
 ///
@@ -479,14 +397,7 @@ pub fn try_init_host_server(
     headers: HeaderMap,
     room_id: u64,
 ) -> Result<(StatusCode, String), String> {
-    let client = build_blocking_client()?;
-    let mut request_headers = headers;
-    request_headers.insert(
-        reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static(USER_AGENT),
-    );
-
-    let wbi_keys = get_wbi_keys(request_headers.clone())?;
+    let wbi_keys = get_wbi_keys(headers.clone())?;
     let params = vec![
         ("id", room_id.to_string()),
         ("type", "0".to_string()),
@@ -494,18 +405,7 @@ pub fn try_init_host_server(
     ];
     let signed_query = encode_wbi(params, wbi_keys);
     let url = format!("{}?{}", DANMAKU_SERVER_CONF_URL, signed_query);
-
-    let resp = client
-        .get(url)
-        .headers(request_headers)
-        .send()
-        .map_err(|e| format!("init host server request failed: {}", e))?;
-    let stat = resp.status();
-    let body = resp
-        .text()
-        .map_err(|e| format!("init host server body read failed: {}", e))?;
-    log::info!("init host server response body: {:?}", body);
-    Ok((stat, body))
+    blocking_get_text(&url, headers, "init host server")
 }
 
 pub fn init_host_server(headers: HeaderMap, room_id: u64) -> (StatusCode, String) {
@@ -535,41 +435,34 @@ struct ResWbi {
     data: Data,
 }
 
-// 对 imgKey 和 subKey 进行字符顺序打乱编码
 fn get_mixin_key(orig: &[u8]) -> String {
     MIXIN_KEY_ENC_TAB
         .iter()
         .take(32)
         .map(|&i| orig[i] as char)
-        .collect::<String>()
+        .collect()
 }
 
 fn get_url_encoded(s: &str) -> String {
-    s.chars()
-        .filter_map(|c| match c.is_ascii_alphanumeric() || "-_.~".contains(c) {
-            true => Some(c.to_string()),
-            false => {
-                // 过滤 value 中的 "!'()*" 字符
-                if "!'()*".contains(c) {
-                    return None;
-                }
-                let encoded = c
-                    .encode_utf8(&mut [0; 4])
-                    .bytes()
-                    .fold("".to_string(), |acc, b| acc + &format!("%{:02X}", b));
-                Some(encoded)
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+            out.push(c);
+        } else if !"!'()*".contains(c) {
+            for b in c.encode_utf8(&mut [0; 4]).bytes() {
+                out.push_str(&format!("%{:02X}", b));
             }
-        })
-        .collect::<String>()
+        }
+    }
+    out
 }
 
-// 为请求参数进行 wbi 签名
-fn encode_wbi(params: Vec<(&str, String)>, (img_key, sub_key): (String, String)) -> String {
+fn encode_wbi(params: Vec<(&str, String)>, keys: (String, String)) -> String {
     let cur_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|t| t.as_secs())
         .unwrap_or(0);
-    _encode_wbi(params, (img_key, sub_key), cur_time)
+    _encode_wbi(params, keys, cur_time)
 }
 
 fn _encode_wbi(
@@ -578,47 +471,30 @@ fn _encode_wbi(
     timestamp: u64,
 ) -> String {
     let mixin_key = get_mixin_key((img_key + &sub_key).as_bytes());
-    // 添加当前时间戳
     params.push(("wts", timestamp.to_string()));
-    // 重新排序
     params.sort_by(|a, b| a.0.cmp(b.0));
-    // 拼接参数
     let query = params
         .iter()
         .map(|(k, v)| format!("{}={}", get_url_encoded(k), get_url_encoded(v)))
         .collect::<Vec<_>>()
         .join("&");
-    // 计算签名
-    let web_sign = format!("{:x}", md5::compute(query.clone() + &mixin_key));
-    // 返回最终的 query
-    query + &format!("&w_rid={}", web_sign)
+    let web_sign = format!("{:x}", md5::compute(format!("{}{}", query, mixin_key)));
+    format!("{}&w_rid={}", query, web_sign)
 }
 
 fn get_wbi_keys(headers: HeaderMap) -> Result<(String, String), String> {
-    let client = build_blocking_client()?;
-    let mut request_headers = headers;
-    request_headers.insert(
-        reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static(USER_AGENT),
-    );
-
-    let response = client
-        .get(UID_INIT_URL)
-        .headers(request_headers)
-        .send()
-        .map_err(|e| format!("WBI nav request failed: {}", e))?;
-
+    let response = blocking_get(UID_INIT_URL, headers, "WBI nav")?;
     let res_wbi: ResWbi = response
         .json()
         .map_err(|e| format!("WBI nav JSON decode failed: {}", e))?;
-    let img_key = take_filename(res_wbi.data.wbi_img.img_url)
+    let img_key = take_filename(&res_wbi.data.wbi_img.img_url)
         .ok_or_else(|| "WBI img_url missing key filename".to_string())?;
-    let sub_key = take_filename(res_wbi.data.wbi_img.sub_url)
+    let sub_key = take_filename(&res_wbi.data.wbi_img.sub_url)
         .ok_or_else(|| "WBI sub_url missing key filename".to_string())?;
     Ok((img_key, sub_key))
 }
 
-fn take_filename(url: String) -> Option<String> {
+fn take_filename(url: &str) -> Option<String> {
     url.rsplit_once('/')
         .and_then(|(_, s)| s.rsplit_once('.'))
         .map(|(s, _)| s.to_string())
@@ -645,24 +521,16 @@ mod tests {
     #[test]
     fn test_take_filename() {
         assert_eq!(
-            take_filename(
-                "https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png".to_string()
-            ),
+            take_filename("https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png"),
             Some("7cd084941338484aae1ad9425b84077c".to_string())
         );
 
         assert_eq!(
-            take_filename(
-                "https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png".to_string()
-            ),
+            take_filename("https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png"),
             Some("4932caff0ff746eab6f01bf08b70ac45".to_string())
         );
 
-        // Test edge case with no extension
-        assert_eq!(
-            take_filename("https://example.com/path/file".to_string()),
-            None
-        );
+        assert_eq!(take_filename("https://example.com/path/file"), None);
     }
 
     #[test]
@@ -775,91 +643,32 @@ mod tests {
     }
 
     #[test]
-    fn test_correct_bilibili_url_signature() {
-        // Test the exact URL from the working example:
-        // "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id=24779526&type=0&web_location=444.8&wts=1748308267&w_rid=884cf361b8ad4e239b4a9dbbb7134679"
-        // "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id=24779526&type=0&web_location=444.8&w_rid=d1e619744b4977f88ed67524a1f567cc&wts=1751072897"
-
-        let params = vec![
-            ("id", String::from("24779526")),
-            ("type", String::from("0")),
-            ("web_location", String::from("444.8")),
+    fn test_bilibili_danmu_url_signatures() {
+        let cases = [
+            (1751072897_u64, "d1e619744b4977f88ed67524a1f567cc"),
+            (1748311635_u64, "fa20533eb27334ba6f2ec7263721319a"),
+            (1748312554_u64, "30f250e8abd9effea1bcb88aab416507"),
         ];
-
-        let result = _encode_wbi(
-            params,
-            (
-                "7cd084941338484aae1ad9425b84077c".to_string(),
-                "4932caff0ff746eab6f01bf08b70ac45".to_string(),
-            ),
-            1751072897,
-        );
-
-        // Expected complete query string from working URL
-        let expected = "id=24779526&type=0&web_location=444.8&wts=1751072897&w_rid=d1e619744b4977f88ed67524a1f567cc";
-        assert_eq!(result, expected);
-
-        // Extract and verify the w_rid specifically
-        let w_rid = result.split("w_rid=").nth(1).unwrap();
-        assert_eq!(w_rid, "d1e619744b4977f88ed67524a1f567cc");
-    }
-
-    #[test]
-    fn test_second_bilibili_url_signature() {
-        // Test the second URL example:
-        // "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id=24779526&type=0&web_location=444.8&w_rid=fa20533eb27334ba6f2ec7263721319a&wts=1748311635"
-
-        let params = vec![
-            ("id", String::from("24779526")),
-            ("type", String::from("0")),
-            ("web_location", String::from("444.8")),
-        ];
-
-        let result = _encode_wbi(
-            params,
-            (
-                "7cd084941338484aae1ad9425b84077c".to_string(),
-                "4932caff0ff746eab6f01bf08b70ac45".to_string(),
-            ),
-            1748311635,
-        );
-
-        // Expected complete query string from working URL
-        let expected = "id=24779526&type=0&web_location=444.8&wts=1748311635&w_rid=fa20533eb27334ba6f2ec7263721319a";
-        assert_eq!(result, expected);
-
-        // Extract and verify the w_rid specifically
-        let w_rid = result.split("w_rid=").nth(1).unwrap();
-        assert_eq!(w_rid, "fa20533eb27334ba6f2ec7263721319a");
-    }
-
-    #[test]
-    fn test_third_bilibili_url_signature() {
-        // Test the third URL example from README:
-        // "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id=24779526&type=0&web_location=444.8&wts=1748312554&w_rid=30f250e8abd9effea1bcb88aab416507"
-
-        let params = vec![
-            ("id", String::from("24779526")),
-            ("type", String::from("0")),
-            ("web_location", String::from("444.8")),
-        ];
-
-        let result = _encode_wbi(
-            params,
-            (
-                "7cd084941338484aae1ad9425b84077c".to_string(),
-                "4932caff0ff746eab6f01bf08b70ac45".to_string(),
-            ),
-            1748312554,
-        );
-
-        // Expected complete query string from working URL
-        let expected = "id=24779526&type=0&web_location=444.8&wts=1748312554&w_rid=30f250e8abd9effea1bcb88aab416507";
-        assert_eq!(result, expected);
-
-        // Extract and verify the w_rid specifically
-        let w_rid = result.split("w_rid=").nth(1).unwrap();
-        assert_eq!(w_rid, "30f250e8abd9effea1bcb88aab416507");
+        for (ts, expected_w_rid) in cases {
+            let params = vec![
+                ("id", String::from("24779526")),
+                ("type", String::from("0")),
+                ("web_location", String::from("444.8")),
+            ];
+            let result = _encode_wbi(
+                params,
+                (
+                    "7cd084941338484aae1ad9425b84077c".to_string(),
+                    "4932caff0ff746eab6f01bf08b70ac45".to_string(),
+                ),
+                ts,
+            );
+            let expected = format!(
+                "id=24779526&type=0&web_location=444.8&wts={}&w_rid={}",
+                ts, expected_w_rid
+            );
+            assert_eq!(result, expected);
+        }
     }
 
     #[test]

@@ -1,4 +1,3 @@
-// src/commands.rs
 //! Stateless Bilibili live command, room metadata, SuperChat, and cookie protocol parsers.
 
 use crate::models::{
@@ -145,13 +144,8 @@ fn extract_danmu_emots(info: &[Value]) -> Option<BTreeMap<String, String>> {
 
 fn extract_danmu_face(info: &[Value]) -> Option<String> {
     let meta = info.first()?.get(15)?;
-    if let Some(face) = meta
-        .get("user")
-        .and_then(|u| u.get("base"))
-        .and_then(|b| b.get("face"))
-        .and_then(non_empty_str)
-    {
-        return Some(normalize_bili_url(&face));
+    if let Some(face) = meta.get("user").and_then(|u| extract_uinfo_fields(u).face) {
+        return Some(face);
     }
 
     if let Some(extra_str) = meta.get("extra").and_then(|e| e.as_str())
@@ -159,11 +153,9 @@ fn extract_danmu_face(info: &[Value]) -> Option<String> {
     {
         if let Some(face) = extra_val
             .get("user")
-            .and_then(|u| u.get("base"))
-            .and_then(|b| b.get("face"))
-            .and_then(non_empty_str)
+            .and_then(|u| extract_uinfo_fields(u).face)
         {
-            return Some(normalize_bili_url(&face));
+            return Some(face);
         }
         if let Some(face) = extra_val.get("face").and_then(non_empty_str) {
             return Some(normalize_bili_url(&face));
@@ -176,6 +168,15 @@ fn extract_danmu_face(info: &[Value]) -> Option<String> {
 fn extract_medal_from_obj(obj: &Value) -> (Option<String>, Option<u32>) {
     if obj.is_null() {
         return (None, None);
+    }
+    if let Ok(medal) = serde_json::from_value::<crate::pb::EventUserMedal>(obj.clone()) {
+        let name = medal.name.trim();
+        if !name.is_empty() {
+            return (
+                Some(name.to_string()),
+                (medal.level > 0).then_some(medal.level),
+            );
+        }
     }
     let name = obj
         .get("medal_name")
@@ -195,46 +196,32 @@ fn extract_medal_from_obj(obj: &Value) -> (Option<String>, Option<u32>) {
 }
 
 fn extract_uinfo_fields(uinfo: &Value) -> PbExtractedUser {
-    let uid = uinfo.get("uid").and_then(value_as_u64).filter(|&u| u > 0);
-    let base = uinfo.get("base");
-    let uname = base
-        .and_then(|b| b.get("name").or_else(|| b.get("uname")))
-        .and_then(non_empty_str)
-        .or_else(|| {
-            uinfo
-                .get("uname")
-                .or_else(|| uinfo.get("name"))
-                .and_then(non_empty_str)
-        });
-    let face = base
-        .and_then(|b| b.get("face"))
-        .and_then(non_empty_str)
-        .map(|u| normalize_bili_url(&u))
-        .or_else(|| {
-            uinfo
-                .get("face")
-                .and_then(non_empty_str)
-                .map(|u| normalize_bili_url(&u))
-        });
-    let (medal_name, medal_level) = uinfo
-        .get("medal")
-        .or_else(|| uinfo.get("fans_medal"))
-        .map(extract_medal_from_obj)
-        .unwrap_or((None, None));
-    let guard_level = uinfo
-        .get("guard")
-        .and_then(|g| g.get("level"))
-        .and_then(value_as_u64)
-        .filter(|&l| l > 0)
-        .and_then(|l| u8::try_from(l).ok());
-    PbExtractedUser {
-        uid,
-        uname,
-        face,
-        medal_name,
-        medal_level,
-        guard_level,
+    let mut user = serde_json::from_value::<crate::pb::EventUserInfo>(uinfo.clone())
+        .map(|info| extract_event_user_info(&info))
+        .unwrap_or_default();
+    if user.uid.is_none() {
+        user.uid = uinfo.get("uid").and_then(value_as_u64).filter(|&u| u > 0);
     }
+    if user.uname.is_none() {
+        user.uname = uinfo
+            .get("uname")
+            .or_else(|| uinfo.get("name"))
+            .and_then(non_empty_str);
+    }
+    if user.face.is_none() {
+        user.face = uinfo
+            .get("face")
+            .and_then(non_empty_str)
+            .map(|u| normalize_bili_url(&u));
+    }
+    if user.medal_name.is_none()
+        && let Some(m) = uinfo.get("medal").or_else(|| uinfo.get("fans_medal"))
+    {
+        let (mn, ml) = extract_medal_from_obj(m);
+        user.medal_name = mn;
+        user.medal_level = ml;
+    }
+    user
 }
 
 fn apply_extracted_user(ev: &mut RawBiliEvent, user: PbExtractedUser) {
@@ -509,6 +496,17 @@ fn normalize_bili_ts_ms(ts: u64, fallback_ms: u64) -> u64 {
     }
 }
 
+fn apply_pb_medal(ev: &mut RawBiliEvent, name: &str, level: u32, guard_level: u32) {
+    let mn = name.trim();
+    if ev.medal_name.is_none() && !mn.is_empty() {
+        ev.medal_name = Some(mn.to_string());
+        ev.medal_level = (level > 0).then_some(level);
+    }
+    if ev.guard_level.is_none() && guard_level > 0 {
+        ev.guard_level = u8::try_from(guard_level).ok();
+    }
+}
+
 fn apply_dm_pb(ev: &mut RawBiliEvent, dm: &EventDm) {
     if ev.content.is_empty() && !dm.content.is_empty() {
         ev.content = dm.content.clone();
@@ -529,12 +527,8 @@ fn apply_dm_pb(ev: &mut RawBiliEvent, dm: &EventDm) {
         if ev.face.is_none() && !user.face.trim().is_empty() {
             ev.face = Some(normalize_bili_url(&user.face));
         }
-        if ev.medal_name.is_none()
-            && let Some(medal) = user.medal.as_ref()
-            && !medal.name.trim().is_empty()
-        {
-            ev.medal_name = Some(medal.name.trim().to_string());
-            ev.medal_level = (medal.level > 0).then_some(medal.level as u32);
+        if let Some(medal) = user.medal.as_ref() {
+            apply_pb_medal(ev, &medal.name, medal.level.max(0) as u32, 0);
         }
     }
     if ev.emots.is_none() && !dm.emoticons.is_empty() {
@@ -591,14 +585,7 @@ fn parse_send_gift_v2_events(
         ..Default::default()
     };
     if let Some(medal) = decoded.medal_info.as_ref() {
-        let mn = medal.name.trim();
-        if !mn.is_empty() {
-            base_user.medal_name = Some(mn.to_string());
-            base_user.medal_level = (medal.level > 0).then_some(medal.level);
-        }
-        if base_user.guard_level.is_none() && medal.guard_level > 0 {
-            base_user.guard_level = u8::try_from(medal.guard_level).ok();
-        }
+        apply_pb_medal(&mut base_user, &medal.name, medal.level, medal.guard_level);
     }
     if let Some(uinfo) = decoded.sender_uinfo.as_ref() {
         apply_extracted_user(&mut base_user, extract_event_user_info(uinfo));
@@ -689,6 +676,44 @@ fn extract_entry_effect_copy(raw: &str) -> (Option<String>, String) {
     (uname, clean)
 }
 
+fn extract_live_start_time(payload: &Value, now_ms: u64) -> u64 {
+    payload
+        .get("live_time")
+        .or_else(|| payload.get("data").and_then(|d| d.get("live_time")))
+        .and_then(|v| {
+            value_as_u64(v).or_else(|| {
+                v.as_str()
+                    .and_then(|s| parse_bili_live_time_to_unix_secs(1, s))
+            })
+        })
+        .filter(|&t| t > 0)
+        .unwrap_or(now_ms / 1000)
+}
+
+fn is_preparing_round(payload: &Value) -> bool {
+    payload
+        .get("round")
+        .or_else(|| payload.get("data").and_then(|d| d.get("round")))
+        .and_then(value_as_u64)
+        == Some(1)
+}
+
+fn populate_superchat_user_and_medal(item: &Value, ev: &mut RawBiliEvent) {
+    ev.uid = item.get("uid").and_then(value_as_u64).unwrap_or(0);
+    if let Some(u) = item.get("user_info") {
+        ev.uname = u.get("uname").and_then(non_empty_str).unwrap_or_default();
+        ev.face = u
+            .get("face")
+            .and_then(non_empty_str)
+            .map(|f| normalize_bili_url(&f));
+    }
+    if let Some(m) = item.get("medal_info") {
+        let (mn, ml) = extract_medal_from_obj(m);
+        ev.medal_name = mn;
+        ev.medal_level = ml;
+    }
+}
+
 /// Convert a Bilibili command packet into zero or more canonical `RawBiliEvent`s.
 pub fn parse_bili_cmd_events(
     cmd: &str,
@@ -748,26 +773,11 @@ fn parse_single_bili_cmd_json(
         "LIVE" => {
             ev.kind = "live".to_string();
             ev.content = "直播开始".to_string();
-            ev.start_time = payload
-                .get("live_time")
-                .or_else(|| payload.get("data").and_then(|d| d.get("live_time")))
-                .and_then(|v| {
-                    value_as_u64(v).or_else(|| {
-                        v.as_str()
-                            .and_then(|s| parse_bili_live_time_to_unix_secs(1, s))
-                    })
-                })
-                .filter(|&t| t > 0)
-                .or(Some(now / 1000));
+            ev.start_time = Some(extract_live_start_time(payload, now));
         }
         "PREPARING" => {
             ev.kind = "preparing".to_string();
-            let is_round = payload
-                .get("round")
-                .or_else(|| payload.get("data").and_then(|d| d.get("round")))
-                .and_then(value_as_u64)
-                == Some(1);
-            ev.content = if is_round {
+            ev.content = if is_preparing_round(payload) {
                 "直播结束（进入轮播）".to_string()
             } else {
                 "直播结束".to_string()
@@ -908,19 +918,7 @@ fn parse_single_bili_cmd_json(
         "SUPER_CHAT_MESSAGE" => {
             let data = payload.get("data")?;
             ev.kind = "superchat".to_string();
-            ev.uid = data.get("uid").and_then(value_as_u64).unwrap_or(0);
-            if let Some(u) = data.get("user_info") {
-                ev.uname = u.get("uname").and_then(non_empty_str).unwrap_or_default();
-                ev.face = u
-                    .get("face")
-                    .and_then(non_empty_str)
-                    .map(|f| normalize_bili_url(&f));
-            }
-            if let Some(m) = data.get("medal_info") {
-                let (mn, ml) = extract_medal_from_obj(m);
-                ev.medal_name = mn;
-                ev.medal_level = ml;
-            }
+            populate_superchat_user_and_medal(data, &mut ev);
             if let Some(uinfo) = data.get("uinfo").or_else(|| data.get("sender_uinfo")) {
                 apply_extracted_user(&mut ev, extract_uinfo_fields(uinfo));
             }
@@ -1039,15 +1037,8 @@ fn parse_single_bili_cmd_json(
                         .then(|| u8::try_from(decoded.privilege_type).ok())
                         .flatten()
                 });
-            if let Some(m) = decoded.medal {
-                let mn = m.name.trim().to_string();
-                if !mn.is_empty() {
-                    ev.medal_name = Some(mn);
-                    ev.medal_level = (m.level > 0).then_some(m.level);
-                }
-                if ev.guard_level.is_none() && m.guard_level > 0 {
-                    ev.guard_level = u8::try_from(m.guard_level).ok();
-                }
+            if let Some(m) = decoded.medal.as_ref() {
+                apply_pb_medal(&mut ev, &m.name, m.level, m.guard_level);
             }
             if let Some(uinfo) = decoded.uinfo.as_ref() {
                 apply_extracted_user(&mut ev, extract_event_user_info(uinfo));
@@ -1210,7 +1201,6 @@ pub fn parse_active_super_chats_json(
             room_id,
             room_uname: room_uname.to_string(),
             kind: "superchat".to_string(),
-            uid: item.get("uid").and_then(value_as_u64).unwrap_or(0),
             content: message,
             price: item
                 .get("price")
@@ -1224,19 +1214,7 @@ pub fn parse_active_super_chats_json(
             raw_cmd: "SUPER_CHAT_MESSAGE".to_string(),
             ..Default::default()
         };
-
-        if let Some(u) = item.get("user_info") {
-            ev.uname = u.get("uname").and_then(non_empty_str).unwrap_or_default();
-            ev.face = u
-                .get("face")
-                .and_then(non_empty_str)
-                .map(|f| normalize_bili_url(&f));
-        }
-        if let Some(m) = item.get("medal_info") {
-            let (mn, ml) = extract_medal_from_obj(m);
-            ev.medal_name = mn;
-            ev.medal_level = ml;
-        }
+        populate_superchat_user_and_medal(item, &mut ev);
         events.push(ev);
     }
 
@@ -1347,18 +1325,9 @@ pub fn parse_buvid3_spi_json(json: &Value) -> Option<String> {
 
 /// Extract `buvid3` from HTTP `Set-Cookie` headers returned by `https://data.bilibili.com/v/`.
 pub fn parse_set_cookie_buvid3(set_cookies: &[String]) -> Option<String> {
-    for hdr in set_cookies {
-        if let Some(val) = hdr
-            .split(';')
-            .next()
-            .and_then(|kv| kv.trim().strip_prefix("buvid3="))
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            return Some(val.to_string());
-        }
-    }
-    None
+    set_cookies
+        .iter()
+        .find_map(|hdr| extract_cookie_value(hdr.split(';').next()?, "buvid3"))
 }
 
 /// Parse `https://passport.bilibili.com/x/passport-login/web/qrcode/generate` JSON.
@@ -1392,16 +1361,22 @@ pub fn parse_my_room_response(resp: &Value, room_uname: &str) -> Option<RoomQuic
     let data = &resp["data"];
     let room_status = data["roomStatus"].as_i64().unwrap_or(0);
     let room_id = value_as_u64(&data["roomid"]).unwrap_or(0);
-    if room_status == 1 && room_id > 0 {
-        Some(RoomQuickItem {
-            room_id,
-            room_uname: room_uname.to_string(),
-            title: data["title"].as_str().unwrap_or("").to_string(),
-            is_live: data["liveStatus"].as_i64() == Some(1),
-        })
-    } else {
-        None
-    }
+    (room_status == 1 && room_id > 0).then(|| RoomQuickItem {
+        room_id,
+        room_uname: room_uname.to_string(),
+        title: data["title"].as_str().unwrap_or("").to_string(),
+        is_live: data["liveStatus"].as_i64() == Some(1),
+    })
+}
+
+fn parse_room_quick_item(item: &Value) -> Option<RoomQuickItem> {
+    let room_id = value_as_u64(&item["roomid"]).filter(|&id| id > 0)?;
+    Some(RoomQuickItem {
+        room_id,
+        room_uname: item["uname"].as_str().unwrap_or("").to_string(),
+        title: item["title"].as_str().unwrap_or("").to_string(),
+        is_live: true,
+    })
 }
 
 /// Parse `https://api.live.bilibili.com/relation/v1/feed/feed_list` JSON into live followed rooms.
@@ -1411,22 +1386,7 @@ pub fn parse_following_feed_list_response(json: &Value) -> Option<Vec<RoomQuickI
         return None;
     }
     let arr = json["data"]["list"].as_array()?;
-    let items = arr
-        .iter()
-        .filter_map(|item| {
-            let room_id = value_as_u64(&item["roomid"])?;
-            if room_id == 0 {
-                return None;
-            }
-            Some(RoomQuickItem {
-                room_id,
-                room_uname: item["uname"].as_str().unwrap_or("").to_string(),
-                title: item["title"].as_str().unwrap_or("").to_string(),
-                is_live: true,
-            })
-        })
-        .collect();
-    Some(items)
+    Some(arr.iter().filter_map(parse_room_quick_item).collect())
 }
 
 /// Parse `https://api.live.bilibili.com/xlive/web-ucenter/user/following` JSON into currently live rooms.
@@ -1439,18 +1399,7 @@ pub fn parse_following_live_response(resp: &Value) -> Vec<RoomQuickItem> {
         .map(|arr| {
             arr.iter()
                 .filter(|item| item["live_status"].as_i64() == Some(1))
-                .filter_map(|item| {
-                    let room_id = value_as_u64(&item["roomid"])?;
-                    if room_id == 0 {
-                        return None;
-                    }
-                    Some(RoomQuickItem {
-                        room_id,
-                        room_uname: item["uname"].as_str().unwrap_or("").to_string(),
-                        title: item["title"].as_str().unwrap_or("").to_string(),
-                        is_live: true,
-                    })
-                })
+                .filter_map(parse_room_quick_item)
                 .collect()
         })
         .unwrap_or_default()
@@ -1466,17 +1415,7 @@ pub fn apply_room_meta_cmd(
     let base_cmd = cmd.split(':').next().unwrap_or(cmd);
     match base_cmd {
         "LIVE" => {
-            let start_sec = payload
-                .get("live_time")
-                .or_else(|| payload.get("data").and_then(|d| d.get("live_time")))
-                .and_then(|v| {
-                    value_as_u64(v).or_else(|| {
-                        v.as_str()
-                            .and_then(|s| parse_bili_live_time_to_unix_secs(1, s))
-                    })
-                })
-                .filter(|&t| t > 0)
-                .unwrap_or(now_ms / 1000);
+            let start_sec = extract_live_start_time(payload, now_ms);
             meta.live_status = 1;
             meta.start_time = Some(start_sec);
             RoomMetaUpdate::LiveStarted {
@@ -1484,12 +1423,7 @@ pub fn apply_room_meta_cmd(
             }
         }
         "PREPARING" => {
-            let is_round = payload
-                .get("round")
-                .or_else(|| payload.get("data").and_then(|d| d.get("round")))
-                .and_then(value_as_u64)
-                == Some(1);
-            meta.live_status = if is_round { 2 } else { 0 };
+            meta.live_status = if is_preparing_round(payload) { 2 } else { 0 };
             meta.start_time = None;
             RoomMetaUpdate::LiveStopped
         }

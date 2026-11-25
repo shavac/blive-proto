@@ -1,8 +1,7 @@
-// src/models.rs
 //! Data models for Bilibili live danmaku WebSocket client
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current Unix timestamp in milliseconds.
@@ -262,19 +261,6 @@ pub struct AuthMessage {
     pub key: String,
 }
 
-impl AuthMessage {
-    pub fn from(map: &HashMap<String, String>) -> AuthMessage {
-        AuthMessage {
-            uid: map.get("uid").unwrap().parse::<u64>().unwrap(),
-            roomid: map.get("room_id").unwrap().parse::<u64>().unwrap(),
-            protover: 3,
-            platform: "web".to_string(),
-            type_: 2,
-            key: map.get("token").unwrap().to_string(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BiliMessage {
     Danmu {
@@ -297,25 +283,5 @@ pub enum BiliMessage {
         /// Number of online users in the live room
         online_count: u64,
     },
-    // Add more variants as needed
     Raw(serde_json::Value),
-    #[deprecated(note = "Use Raw variant instead")]
-    Unsupported,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_auth_message_from_map() {
-        let mut map = std::collections::HashMap::new();
-        map.insert("uid".to_string(), "12345".to_string());
-        map.insert("room_id".to_string(), "67890".to_string());
-        map.insert("token".to_string(), "test_token".to_string());
-        let auth = AuthMessage::from(&map);
-        assert_eq!(auth.uid, 12345);
-        assert_eq!(auth.roomid, 67890);
-        assert_eq!(auth.key, "test_token");
-    }
 }

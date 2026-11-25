@@ -1,4 +1,3 @@
-// src/websocket.rs
 //! WebSocket client for Bilibili live danmaku messages (refactored from bili_live_dm)
 
 use base64::{Engine as _, engine::general_purpose};
@@ -17,7 +16,7 @@ use http::Response;
 use std::thread;
 
 use crate::auth::*;
-use crate::commands::append_cookie_kv;
+use crate::commands::{append_cookie_kv, extract_cookie_value, value_as_u64};
 use crate::models::{AuthMessage, BiliMessage, DanmuServer, MsgHead};
 
 pub struct BiliLiveClient {
@@ -41,8 +40,7 @@ impl BiliLiveClient {
         }
     }
 
-    /// Create a new client with automatic browser cookie detection
-    /// If cookies is None or empty, it will try to find cookies from browser
+    /// Create a new client with explicit cookie validation.
     pub fn new_auto(
         cookies: Option<&str>,
         room_id: &str,
@@ -65,91 +63,75 @@ impl BiliLiveClient {
     }
 
     pub fn send_auth(&mut self) {
-        if let Err(e) = self.send_auth_internal() {
+        let payload = self.auth_msg.clone();
+        if let Err(e) = self.send_packet_with_retry(&payload, Operation::AUTH, "auth") {
             log::error!("failed to send auth packet: {}", e);
         }
     }
 
     pub fn send_heart_beat(&mut self) {
-        if let Err(e) = self.send_heart_beat_internal() {
+        if let Err(e) = self.send_packet_with_retry("{}", Operation::HEARTBEAT, "heartbeat") {
             log::error!("failed to send heartbeat: {}", e);
         }
     }
 
     pub fn parse_ws_message(&mut self, resv: Vec<u8>) {
-        let mut offset = 0;
-        let header = &resv[0..16];
-        let mut head_1 = get_msg_header(header);
-        if head_1.operation == 5 || head_1.operation == 8 {
-            loop {
-                let body: &[u8] = &resv[offset + 16..offset + (head_1.pack_len as usize)];
-                self.parse_business_message(head_1, body);
-                offset += head_1.pack_len as usize;
-                if offset >= resv.len() {
-                    break;
-                }
-                let temp_head = &resv[offset..(offset + 16)];
-                head_1 = get_msg_header(temp_head);
+        let mut jsons = Vec::new();
+        let res = decode_bili_frames(&resv, &mut jsons);
+        if res.auth_ack {
+            self.send_heart_beat();
+        }
+        if let Some(pop) = res.popularity {
+            log::info!("popularity:{}", pop);
+        }
+        for val in jsons {
+            if let Some(msg) = handle(val) {
+                let _ = self.ss.try_send(msg);
             }
-        } else if head_1.operation == 3 {
-            let mut body: [u8; 4] = [0, 0, 0, 0];
-            body[0] = resv[16];
-            body[1] = resv[17];
-            body[2] = resv[18];
-            body[3] = resv[19];
-            let popularity = i32::from_be_bytes(body);
-            log::info!("popularity:{}", popularity);
-        } else {
-            log::error!(
-                "unknown message operation={:?}, header={:?}}}",
-                head_1.operation,
-                head_1
-            )
         }
     }
 
     pub fn parse_business_message(&mut self, h: MsgHead, b: &[u8]) {
-        if h.operation == 5 {
-            if h.ver == 3 {
-                let res: Vec<u8> = decompress(b).unwrap();
-                self.parse_ws_message(res);
-            } else if h.ver == 0 {
-                let s = String::from_utf8(b.to_vec()).unwrap();
-                let res_json: Value = serde_json::from_str(s.as_str()).unwrap();
-                if let Some(msg) = handle(res_json) {
-                    let _ = self.ss.try_send(msg);
+        match h.operation {
+            5 => match h.ver {
+                3 => {
+                    if let Ok(res) = decompress(b) {
+                        self.parse_ws_message(res);
+                    }
                 }
-            } else {
-                log::error!("Unknown compression format");
-            }
-        } else if h.operation == 8 {
-            self.send_heart_beat();
-        } else {
-            log::error!("Unknown message format {}", h.operation);
+                0 => {
+                    if let Ok(res_json) = serde_json::from_slice::<Value>(b)
+                        && let Some(msg) = handle(res_json)
+                    {
+                        let _ = self.ss.try_send(msg);
+                    }
+                }
+                _ => log::error!("Unknown compression format"),
+            },
+            8 => self.send_heart_beat(),
+            _ => log::error!("Unknown message format {}", h.operation),
         }
     }
 
     pub fn receive(&mut self) -> Result<(), String> {
-        if self.ws.can_read() {
-            let msg = self.ws.read();
-            match msg {
-                Ok(m) => {
-                    let res = m.into_data();
-                    if res.len() >= 16 {
-                        self.parse_ws_message(res);
-                    }
-                    Ok(())
+        if !self.ws.can_read() {
+            return Ok(());
+        }
+        match self.ws.read() {
+            Ok(m) => {
+                let res = m.into_data();
+                if res.len() >= 16 {
+                    self.parse_ws_message(res);
                 }
-                Err(e) => {
-                    let msg = format!("read msg error: {}", e);
-                    log::warn!("{}", msg);
-                    self.reconnect().map_err(|reconnect_err| {
-                        format!("{}; reconnect failed: {}", msg, reconnect_err)
-                    })
-                }
+                Ok(())
             }
-        } else {
-            Ok(())
+            Err(e) => {
+                let msg = format!("read msg error: {}", e);
+                log::warn!("{}", msg);
+                self.reconnect().map_err(|reconnect_err| {
+                    format!("{}; reconnect failed: {}", msg, reconnect_err)
+                })
+            }
         }
     }
 
@@ -164,39 +146,22 @@ impl BiliLiveClient {
         Ok((ws, auth_msg))
     }
 
-    fn send_auth_internal(&mut self) -> Result<(), String> {
-        match self.ws.send(Message::Binary(make_packet(
-            self.auth_msg.as_str(),
-            Operation::AUTH,
-        ))) {
+    fn send_packet_with_retry(
+        &mut self,
+        body: &str,
+        op: Operation,
+        label: &str,
+    ) -> Result<(), String> {
+        let packet = make_packet(body, op);
+        match self.ws.send(Message::Binary(packet.clone())) {
             Ok(()) => Ok(()),
             Err(e) => {
-                let msg = format!("send auth error: {}", e);
+                let msg = format!("send {} error: {}", label, e);
                 log::warn!("{}", msg);
                 self.reconnect()?;
                 self.ws
-                    .send(Message::Binary(make_packet(
-                        self.auth_msg.as_str(),
-                        Operation::AUTH,
-                    )))
-                    .map_err(|retry_err| format!("{}; resend auth failed: {}", msg, retry_err))
-            }
-        }
-    }
-
-    fn send_heart_beat_internal(&mut self) -> Result<(), String> {
-        match self
-            .ws
-            .send(Message::Binary(make_packet("{}", Operation::HEARTBEAT)))
-        {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let msg = format!("send heartbeat error: {}", e);
-                log::warn!("{}", msg);
-                self.reconnect()?;
-                self.ws
-                    .send(Message::Binary(make_packet("{}", Operation::HEARTBEAT)))
-                    .map_err(|retry_err| format!("{}; resend heartbeat failed: {}", msg, retry_err))
+                    .send(Message::Binary(packet))
+                    .map_err(|retry_err| format!("{}; resend {} failed: {}", msg, label, retry_err))
             }
         }
     }
@@ -232,23 +197,17 @@ impl BiliLiveClient {
                             return Ok(());
                         }
                         (auth_result, heartbeat_result) => {
-                            let auth_err = auth_result.err().map(|e| e.to_string());
-                            let heartbeat_err = heartbeat_result.err().map(|e| e.to_string());
-                            let reconnect_err = match (auth_err, heartbeat_err) {
-                                (Some(auth_err), Some(heartbeat_err)) => format!(
+                            let reconnect_err = match (auth_result.err(), heartbeat_result.err()) {
+                                (Some(a), Some(h)) => format!(
                                     "reconnected socket but auth resend failed: {}; heartbeat resend failed: {}",
-                                    auth_err, heartbeat_err
+                                    a, h
                                 ),
-                                (Some(auth_err), None) => {
-                                    format!(
-                                        "reconnected socket but auth resend failed: {}",
-                                        auth_err
-                                    )
+                                (Some(a), None) => {
+                                    format!("reconnected socket but auth resend failed: {}", a)
                                 }
-                                (None, Some(heartbeat_err)) => format!(
-                                    "reconnected socket but heartbeat resend failed: {}",
-                                    heartbeat_err
-                                ),
+                                (None, Some(h)) => {
+                                    format!("reconnected socket but heartbeat resend failed: {}", h)
+                                }
                                 (None, None) => unreachable!(),
                             };
                             log::warn!(
@@ -278,23 +237,20 @@ impl BiliLiveClient {
 }
 
 pub fn gen_damu_list(list: &Value) -> Vec<DanmuServer> {
-    let mut res: Vec<DanmuServer> = Vec::new();
-    if let Some(server_list) = list.as_array() {
-        for s in server_list {
-            let Some(host) = s["host"].as_str().filter(|h| !h.trim().is_empty()) else {
-                continue;
-            };
-            let port = s["port"].as_u64().unwrap_or(2243) as i32;
-            let wss_port = s["wss_port"].as_u64().unwrap_or(443) as i32;
-            let ws_port = s["ws_port"].as_u64().unwrap_or(2244) as i32;
-            res.push(DanmuServer {
+    let mut res: Vec<DanmuServer> = list
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let host = s["host"].as_str().filter(|h| !h.trim().is_empty())?;
+            Some(DanmuServer {
                 host: host.to_string(),
-                port,
-                wss_port,
-                ws_port,
-            });
-        }
-    }
+                port: s["port"].as_u64().unwrap_or(2243) as i32,
+                wss_port: s["wss_port"].as_u64().unwrap_or(443) as i32,
+                ws_port: s["ws_port"].as_u64().unwrap_or(2244) as i32,
+            })
+        })
+        .collect();
     if res.is_empty() {
         res.push(DanmuServer::default());
     }
@@ -330,31 +286,12 @@ pub fn try_init_server(cookies: &str, room_id: &str) -> Result<(Value, AuthMessa
     );
     log::debug!("headers: {:?}", headers);
 
-    let sessdata = cookies
-        .split(';')
-        .find_map(|kv| {
-            let mut parts = kv.trim().splitn(2, '=');
-            let key = parts.next()?.trim();
-            let value = parts.next()?.trim();
-            if key == "SESSDATA" {
-                Some(value.to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-
-    let uid = if !sessdata.is_empty() {
+    let uid = if extract_cookie_value(cookies, "SESSDATA").is_some() {
         let (_, body1) = try_init_uid(headers.clone())?;
         let body1_v: Value = serde_json::from_str(&body1)
             .map_err(|e| format!("failed to parse nav UID response JSON: {}", e))?;
 
-        if let Some(mid) = body1_v["data"]["mid"].as_u64().or_else(|| {
-            body1_v["data"]["mid"]
-                .as_i64()
-                .filter(|&m| m >= 0)
-                .map(|m| m as u64)
-        }) {
+        if let Some(mid) = value_as_u64(&body1_v["data"]["mid"]) {
             log::info!("Successfully authenticated with uid: {}", mid);
             mid
         } else {
@@ -407,11 +344,11 @@ pub type WsConnectStream = (WebSocket<TlsStream<TcpStream>>, Response<Option<Vec
 pub fn connect_result(v: Value) -> Result<WsConnectStream, String> {
     let danmu_server = gen_damu_list(&v);
     let (host, url, ws_url) = find_server(danmu_server);
-    let connector: native_tls::TlsConnector =
+    let connector =
         native_tls::TlsConnector::new().map_err(|e| format!("tls init failed: {}", e))?;
-    let stream: TcpStream = TcpStream::connect(url.as_str())
+    let stream = TcpStream::connect(url.as_str())
         .map_err(|e| format!("tcp connect to {} failed: {}", url, e))?;
-    let stream: native_tls::TlsStream<TcpStream> = connector
+    let stream = connector
         .connect(host.as_str(), stream)
         .map_err(|e| format!("tls connect to {} failed: {}", host, e))?;
     let parsed_url =
@@ -429,58 +366,31 @@ pub fn make_packet(body: &str, ops: Operation) -> Vec<u8> {
         .map(|json| json.to_string())
         .unwrap_or_else(|_| body.to_string());
     let body_content = serialized.as_bytes();
-    let pack_len: [u8; 4] = ((16 + body_content.len()) as u32).to_be_bytes();
-    let raw_header_size: [u8; 2] = 16_u16.to_be_bytes();
-    let ver: [u8; 2] = 1_u16.to_be_bytes();
-    let operation: [u8; 4] = match ops {
-        Operation::AUTH => 7_u32.to_be_bytes(),
-        Operation::HEARTBEAT => 2_u32.to_be_bytes(),
+    let pack_len = (16 + body_content.len()) as u32;
+    let operation: u32 = match ops {
+        Operation::AUTH => 7,
+        Operation::HEARTBEAT => 2,
     };
-    let seq_id: [u8; 4] = 1_u32.to_be_bytes();
-    let mut res = Vec::with_capacity(16 + body_content.len());
-    res.extend_from_slice(&pack_len);
-    res.extend_from_slice(&raw_header_size);
-    res.extend_from_slice(&ver);
-    res.extend_from_slice(&operation);
-    res.extend_from_slice(&seq_id);
+    let mut res = Vec::with_capacity(pack_len as usize);
+    res.extend_from_slice(&pack_len.to_be_bytes());
+    res.extend_from_slice(&16_u16.to_be_bytes());
+    res.extend_from_slice(&1_u16.to_be_bytes());
+    res.extend_from_slice(&operation.to_be_bytes());
+    res.extend_from_slice(&1_u32.to_be_bytes());
     res.extend_from_slice(body_content);
     res
 }
 
-pub fn get_msg_header(v_s: &[u8]) -> MsgHead {
-    let mut pack_len: [u8; 4] = [0; 4];
-    let mut raw_header_size: [u8; 2] = [0; 2];
-    let mut ver: [u8; 2] = [0; 2];
-    let mut operation: [u8; 4] = [0; 4];
-    let mut seq_id: [u8; 4] = [0; 4];
-    for (i, v) in v_s.iter().enumerate() {
-        if i < 4 {
-            pack_len[i] = *v;
-            continue;
-        }
-        if i < 6 {
-            raw_header_size[i - 4] = *v;
-            continue;
-        }
-        if i < 8 {
-            ver[i - 6] = *v;
-            continue;
-        }
-        if i < 12 {
-            operation[i - 8] = *v;
-            continue;
-        }
-        if i < 16 {
-            seq_id[i - 12] = *v;
-            continue;
-        }
-    }
+pub fn get_msg_header(buf: &[u8]) -> MsgHead {
+    let mut hdr = [0u8; 16];
+    let len = buf.len().min(16);
+    hdr[..len].copy_from_slice(&buf[..len]);
     MsgHead {
-        pack_len: u32::from_be_bytes(pack_len),
-        raw_header_size: u16::from_be_bytes(raw_header_size),
-        ver: u16::from_be_bytes(ver),
-        operation: u32::from_be_bytes(operation),
-        seq_id: u32::from_be_bytes(seq_id),
+        pack_len: u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]),
+        raw_header_size: u16::from_be_bytes([hdr[4], hdr[5]]),
+        ver: u16::from_be_bytes([hdr[6], hdr[7]]),
+        operation: u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]),
+        seq_id: u32::from_be_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]),
     }
 }
 
@@ -514,30 +424,23 @@ pub fn decode_bili_frames(buf: &[u8], out_jsons: &mut Vec<Value>) -> FrameDecode
         let body = &buf[offset + hdr_len..offset + pack_len];
 
         match head.operation {
-            8 => {
-                result.auth_ack = true;
-            }
-            3 => {
-                if body.len() >= 4 {
-                    let pop = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-                    result.popularity = Some(pop);
-                }
+            8 => result.auth_ack = true,
+            3 if body.len() >= 4 => {
+                result.popularity = Some(u32::from_be_bytes([body[0], body[1], body[2], body[3]]));
             }
             5 => match head.ver {
-                3 => {
-                    if let Ok(decompressed) = decompress(body) {
-                        let sub = decode_bili_frames(&decompressed, out_jsons);
-                        result.auth_ack |= sub.auth_ack;
-                        if sub.popularity.is_some() {
-                            result.popularity = sub.popularity;
-                        }
-                    }
-                }
-                2 => {
-                    let mut decoder = ZlibDecoder::new(body);
-                    let mut decompressed = Vec::new();
-                    if decoder.read_to_end(&mut decompressed).is_ok() {
-                        let sub = decode_bili_frames(&decompressed, out_jsons);
+                2 | 3 => {
+                    let decompressed = if head.ver == 3 {
+                        decompress(body).ok()
+                    } else {
+                        let mut dec = Vec::new();
+                        ZlibDecoder::new(body)
+                            .read_to_end(&mut dec)
+                            .ok()
+                            .map(|_| dec)
+                    };
+                    if let Some(bytes) = decompressed {
+                        let sub = decode_bili_frames(&bytes, out_jsons);
                         result.auth_ack |= sub.auth_ack;
                         if sub.popularity.is_some() {
                             result.popularity = sub.popularity;
@@ -562,8 +465,7 @@ pub fn decode_bili_frames(buf: &[u8], out_jsons: &mut Vec<Value>) -> FrameDecode
     result
 }
 
-/// here we detail [info format is online](https://github.com/SocialSisterYi/bilibili-API-collect/blob/master/docs/live/message_stream.md)
-/// .
+/// Map a Bilibili live JSON command packet into a lightweight [`BiliMessage`].
 pub fn handle(json: Value) -> Option<BiliMessage> {
     let category = json["cmd"].as_str().unwrap_or("");
     let data = json.get("data").unwrap_or(&json);
@@ -596,19 +498,16 @@ pub fn handle(json: Value) -> Option<BiliMessage> {
                 Some(entry) if entry.msg_type == 1 => {
                     let user = if !entry.username.trim().is_empty() {
                         entry.username
-                    } else if let Some(uinfo_name) = entry
-                        .uinfo
-                        .and_then(|u| u.base)
-                        .map(|b| b.name)
-                        .filter(|n| !n.trim().is_empty())
-                    {
-                        uinfo_name
                     } else {
-                        "<unknown>".to_string()
+                        entry
+                            .uinfo
+                            .and_then(|u| u.base)
+                            .map(|b| b.name)
+                            .filter(|n| !n.trim().is_empty())
+                            .unwrap_or_else(|| "<unknown>".to_string())
                     };
                     Some(BiliMessage::RoomEntry { user })
                 }
-                // Preserve other interactions and malformed payloads as raw events.
                 _ => Some(BiliMessage::Raw(json)),
             }
         }
@@ -616,21 +515,17 @@ pub fn handle(json: Value) -> Option<BiliMessage> {
             count: json["data"]["count"].as_u64().unwrap_or(0),
             online_count: json["data"]["online_count"].as_u64().unwrap_or(0),
         }),
-        // Add more cases for other types as needed
         _ => Some(BiliMessage::Raw(json)),
     }
 }
 
-/// Enhanced init_server that can automatically detect cookies from browser
+/// Validate explicit cookies and initialize the danmaku server info and auth message.
 pub fn init_server_auto(
     provided_cookies: Option<&str>,
     room_id: &str,
 ) -> Result<(Value, AuthMessage), String> {
-    // Try to get cookies from provided value or browser cookies
     let cookies = resolve_cookies(provided_cookies)?;
-
     log::info!("Using resolved cookies for authentication");
-
     try_init_server(&cookies, room_id)
 }
 

@@ -1,10 +1,9 @@
-// src/api.rs
 //! Async HTTP client for Bilibili live, authentication, room metadata, and danmaku send APIs.
 
 use crate::auth::{
-    DANMAKU_MAX_CHARS, QrPollStatus, SendDanmakuError, SessionData, form_urlencode,
-    parse_live_user_info_response, parse_nav_response, parse_qr_poll_response,
-    parse_send_danmaku_response,
+    BUVID_INIT_URL, DANMAKU_MAX_CHARS, QrPollStatus, ROOM_INIT_URL, SendDanmakuError, SessionData,
+    UID_INIT_URL, form_urlencode, parse_live_user_info_response, parse_nav_response,
+    parse_qr_poll_response, parse_send_danmaku_response,
 };
 use crate::commands::{
     extract_cookie_value, parse_active_super_chats_json, parse_buvid3_spi_json,
@@ -15,13 +14,13 @@ use crate::commands::{
 use crate::models::{
     AuthState, QrCodeInfo, RawBiliEvent, RoomInfoSnapshot, RoomQuickItem, now_unix_ms,
 };
-use reqwest::header::{CONTENT_TYPE, COOKIE, ORIGIN, REFERER, SET_COOKIE};
+use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderMap, ORIGIN, REFERER, SET_COOKIE};
 use serde_json::Value;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const API_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-pub const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
+pub const NAV_URL: &str = UID_INIT_URL;
 pub const LIVE_USER_INFO_URL: &str =
     "https://api.live.bilibili.com/xlive/web-ucenter/user/get_user_info";
 pub const QR_GENERATE_URL: &str =
@@ -35,13 +34,22 @@ pub const FOLLOWING_LIVE_URL: &str =
     "https://api.live.bilibili.com/xlive/web-ucenter/user/following";
 pub const MASTER_INFO_URL: &str = "https://api.live.bilibili.com/live_user/v1/Master/info";
 pub const ROOM_GET_INFO_URL: &str = "https://api.live.bilibili.com/room/v1/Room/get_info";
-pub const GET_INFO_BY_ROOM_URL: &str =
-    "https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom";
+pub const GET_INFO_BY_ROOM_URL: &str = ROOM_INIT_URL;
 pub const ROOM_INIT_API_URL: &str = "https://api.live.bilibili.com/room/v1/Room/room_init";
 pub const FINGER_SPI_URL: &str = "https://api.bilibili.com/x/frontend/finger/spi";
-pub const BUVID_FALLBACK_URL: &str = "https://data.bilibili.com/v/";
+pub const BUVID_FALLBACK_URL: &str = BUVID_INIT_URL;
 pub const ACTIVE_SUPER_CHAT_URL: &str =
     "https://api.live.bilibili.com/av/v1/SuperChat/getMessageList";
+
+const LIVE_REFERER: &str = "https://live.bilibili.com/";
+
+fn collect_set_cookies(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|hv| hv.to_str().ok().map(str::to_string))
+        .collect()
+}
 
 /// Async HTTP client encapsulating all Bilibili Web / Live REST endpoints and response parsers.
 #[derive(Clone)]
@@ -64,6 +72,44 @@ impl BiliApiClient {
             .build()
             .expect("Failed to construct BiliApiClient HTTP client");
         Self { http }
+    }
+
+    fn live_get(&self, url: &str, cookie: Option<&str>) -> reqwest::RequestBuilder {
+        let req = self.http.get(url).header(REFERER, LIVE_REFERER);
+        match cookie.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(c) => req.header(COOKIE, c),
+            None => req,
+        }
+    }
+
+    async fn fetch_auth_endpoint(
+        &self,
+        url: &str,
+        referer: &str,
+        cookie: &str,
+        label: &str,
+        fallback_mid: u64,
+        parser: fn(&Value, u64) -> Option<AuthState>,
+    ) -> Result<AuthState, String> {
+        let resp = self
+            .http
+            .get(url)
+            .header(COOKIE, cookie)
+            .header(REFERER, referer)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to request Bilibili {} API: {}", label, e))?;
+        let json: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to decode Bilibili {} JSON: {}", label, e))?;
+        parser(&json, fallback_mid).ok_or_else(|| {
+            format!(
+                "unexpected {} payload (code={})",
+                label,
+                json["code"].as_i64().unwrap_or(-1)
+            )
+        })
     }
 
     /// Send a live danmaku text message to `room_id` via `POST /msg/send`.
@@ -139,26 +185,18 @@ impl BiliApiClient {
         let fallback_mid = session.dede_user_id.parse().unwrap_or(0);
 
         let nav_err = match self
-            .http
-            .get(NAV_URL)
-            .header(COOKIE, &cookie)
-            .header(REFERER, "https://www.bilibili.com/")
-            .send()
+            .fetch_auth_endpoint(
+                NAV_URL,
+                "https://www.bilibili.com/",
+                &cookie,
+                "nav",
+                fallback_mid,
+                parse_nav_response,
+            )
             .await
         {
-            Ok(resp) => match resp.json::<Value>().await {
-                Ok(json) => {
-                    if let Some(state) = parse_nav_response(&json, fallback_mid) {
-                        return Ok(state);
-                    }
-                    format!(
-                        "unexpected nav payload (code={})",
-                        json["code"].as_i64().unwrap_or(-1)
-                    )
-                }
-                Err(e) => format!("Failed to decode Bilibili nav JSON: {}", e),
-            },
-            Err(e) => format!("Failed to request Bilibili nav API: {}", e),
+            Ok(state) => return Ok(state),
+            Err(e) => e,
         };
 
         log::warn!(
@@ -166,30 +204,16 @@ impl BiliApiClient {
             nav_err
         );
 
-        let live_err = match self
-            .http
-            .get(LIVE_USER_INFO_URL)
-            .header(COOKIE, &cookie)
-            .header(REFERER, "https://live.bilibili.com/")
-            .send()
-            .await
-        {
-            Ok(resp) => match resp.json::<Value>().await {
-                Ok(json) => {
-                    if let Some(state) = parse_live_user_info_response(&json, fallback_mid) {
-                        return Ok(state);
-                    }
-                    format!(
-                        "unexpected live user_info payload (code={})",
-                        json["code"].as_i64().unwrap_or(-1)
-                    )
-                }
-                Err(e) => format!("Failed to decode Bilibili live user_info JSON: {}", e),
-            },
-            Err(e) => format!("Failed to request Bilibili live user_info API: {}", e),
-        };
-
-        Err(format!("nav: {}; live_user_info: {}", nav_err, live_err))
+        self.fetch_auth_endpoint(
+            LIVE_USER_INFO_URL,
+            LIVE_REFERER,
+            &cookie,
+            "live user_info",
+            fallback_mid,
+            parse_live_user_info_response,
+        )
+        .await
+        .map_err(|live_err| format!("nav: {}; live_user_info: {}", nav_err, live_err))
     }
 
     /// Request a fresh QR login URL and key from `passport.bilibili.com`.
@@ -219,27 +243,18 @@ impl BiliApiClient {
             .await
             .map_err(|e| format!("Failed to request Bilibili QR poll API: {}", e))?;
 
-        let set_cookies: Vec<String> = response
-            .headers()
-            .get_all(SET_COOKIE)
-            .iter()
-            .filter_map(|hv| hv.to_str().ok().map(str::to_string))
-            .collect();
-
+        let set_cookies = collect_set_cookies(response.headers());
         let body: Value = response
             .json()
             .await
             .map_err(|e| format!("Failed to decode Bilibili QR poll JSON: {}", e))?;
 
-        let code = body["data"]["code"].as_i64().unwrap_or(-1);
-        let message = body["data"]["message"].as_str().unwrap_or("");
-        let fallback_url = body["data"]["url"].as_str();
-
+        let data = &body["data"];
         Ok(parse_qr_poll_response(
-            code,
-            message,
+            data["code"].as_i64().unwrap_or(-1),
+            data["message"].as_str().unwrap_or(""),
             &set_cookies,
-            fallback_url,
+            data["url"].as_str(),
         ))
     }
 
@@ -254,12 +269,10 @@ impl BiliApiClient {
             return Ok(None);
         }
 
+        let cookie = session.to_cookie_header();
         let resp: Value = self
-            .http
-            .get(ROOM_INFO_OLD_URL)
+            .live_get(ROOM_INFO_OLD_URL, Some(&cookie))
             .query(&[("mid", mid)])
-            .header(COOKIE, session.to_cookie_header())
-            .header(REFERER, "https://live.bilibili.com/")
             .send()
             .await
             .map_err(|e| format!("Failed to query getRoomInfoOld: {}", e))?
@@ -277,16 +290,11 @@ impl BiliApiClient {
     ) -> Result<Vec<RoomQuickItem>, String> {
         let cookie = session.to_cookie_header();
 
-        let primary = self
-            .http
-            .get(FOLLOWING_FEED_LIST_URL)
+        if let Ok(resp) = self
+            .live_get(FOLLOWING_FEED_LIST_URL, Some(&cookie))
             .query(&[("page", "1"), ("pagesize", "30")])
-            .header(COOKIE, &cookie)
-            .header(REFERER, "https://live.bilibili.com/")
             .send()
-            .await;
-
-        if let Ok(resp) = primary
+            .await
             && let Ok(json) = resp.json::<Value>().await
             && let Some(items) = parse_following_feed_list_response(&json)
         {
@@ -294,11 +302,8 @@ impl BiliApiClient {
         }
 
         let fallback_resp: Value = self
-            .http
-            .get(FOLLOWING_LIVE_URL)
+            .live_get(FOLLOWING_LIVE_URL, Some(&cookie))
             .query(&[("page", "1"), ("page_size", "29")])
-            .header(COOKIE, &cookie)
-            .header(REFERER, "https://live.bilibili.com/")
             .send()
             .await
             .map_err(|e| format!("Failed to query Bilibili following live list: {}", e))?
@@ -311,32 +316,23 @@ impl BiliApiClient {
 
     /// Resolve anchor username from `Master/info` with `getInfoByRoom` fallback.
     pub async fn fetch_anchor_uname(&self, uid: u64, room_id: u64, cookie: Option<&str>) -> String {
-        if uid > 0 {
-            let mut req = self
-                .http
-                .get(MASTER_INFO_URL)
+        if uid > 0
+            && let Ok(resp) = self
+                .live_get(MASTER_INFO_URL, cookie)
                 .query(&[("uid", uid.to_string())])
-                .header(REFERER, "https://live.bilibili.com/");
-            if let Some(c) = cookie.filter(|s| !s.trim().is_empty()) {
-                req = req.header(COOKIE, c);
-            }
-            if let Ok(resp) = req.send().await
-                && let Ok(json) = resp.json::<Value>().await
-                && let Some(uname) = parse_master_info_uname(&json)
-            {
-                return uname;
-            }
+                .send()
+                .await
+            && let Ok(json) = resp.json::<Value>().await
+            && let Some(uname) = parse_master_info_uname(&json)
+        {
+            return uname;
         }
 
-        let mut fallback_req = self
-            .http
-            .get(GET_INFO_BY_ROOM_URL)
+        if let Ok(resp) = self
+            .live_get(GET_INFO_BY_ROOM_URL, cookie)
             .query(&[("room_id", room_id.to_string())])
-            .header(REFERER, "https://live.bilibili.com/");
-        if let Some(c) = cookie.filter(|s| !s.trim().is_empty()) {
-            fallback_req = fallback_req.header(COOKIE, c);
-        }
-        if let Ok(resp) = fallback_req.send().await
+            .send()
+            .await
             && let Ok(json) = resp.json::<Value>().await
             && let Some(snap) = parse_get_info_by_room_json(&json, room_id)
             && !snap.uname.is_empty()
@@ -353,16 +349,13 @@ impl BiliApiClient {
         input_room_id: u64,
         cookie: Option<&str>,
     ) -> Result<RoomInfoSnapshot, String> {
-        let mut info_req = self
-            .http
-            .get(ROOM_GET_INFO_URL)
-            .query(&[("room_id", input_room_id.to_string())])
-            .header(REFERER, "https://live.bilibili.com/");
-        if let Some(c) = cookie.filter(|s| !s.trim().is_empty()) {
-            info_req = info_req.header(COOKIE, c);
-        }
+        let room_str = input_room_id.to_string();
 
-        if let Ok(resp) = info_req.send().await
+        if let Ok(resp) = self
+            .live_get(ROOM_GET_INFO_URL, cookie)
+            .query(&[("room_id", &room_str)])
+            .send()
+            .await
             && let Ok(json) = resp.json::<Value>().await
             && let Some(mut snap) = parse_room_get_info_json(&json, None)
         {
@@ -374,32 +367,20 @@ impl BiliApiClient {
             return Ok(snap);
         }
 
-        let mut req = self
-            .http
-            .get(GET_INFO_BY_ROOM_URL)
-            .query(&[("room_id", input_room_id.to_string())])
-            .header(REFERER, "https://live.bilibili.com/");
-        if let Some(c) = cookie.filter(|s| !s.trim().is_empty()) {
-            req = req.header(COOKIE, c);
-        }
-
-        if let Ok(resp) = req.send().await
+        if let Ok(resp) = self
+            .live_get(GET_INFO_BY_ROOM_URL, cookie)
+            .query(&[("room_id", &room_str)])
+            .send()
+            .await
             && let Ok(json) = resp.json::<Value>().await
             && let Some(snap) = parse_get_info_by_room_json(&json, input_room_id)
         {
             return Ok(snap);
         }
 
-        let mut init_req = self
-            .http
-            .get(ROOM_INIT_API_URL)
-            .query(&[("id", input_room_id.to_string())])
-            .header(REFERER, "https://live.bilibili.com/");
-        if let Some(c) = cookie.filter(|s| !s.trim().is_empty()) {
-            init_req = init_req.header(COOKIE, c);
-        }
-
-        let init_json: Value = init_req
+        let init_json: Value = self
+            .live_get(ROOM_INIT_API_URL, cookie)
+            .query(&[("id", &room_str)])
             .send()
             .await
             .map_err(|e| format!("Failed to query Bilibili room_init API: {}", e))?
@@ -416,15 +397,11 @@ impl BiliApiClient {
             return existing;
         }
 
-        let mut spi_req = self
-            .http
-            .get(FINGER_SPI_URL)
+        if let Ok(resp) = self
+            .live_get(FINGER_SPI_URL, Some(cookie_str))
             .timeout(Duration::from_secs(3))
-            .header(REFERER, "https://live.bilibili.com/");
-        if !cookie_str.trim().is_empty() {
-            spi_req = spi_req.header(COOKIE, cookie_str);
-        }
-        if let Ok(resp) = spi_req.send().await
+            .send()
+            .await
             && let Ok(json) = resp.json::<Value>().await
             && let Some(b3) = parse_buvid3_spi_json(&json)
         {
@@ -437,16 +414,9 @@ impl BiliApiClient {
             .timeout(Duration::from_secs(3))
             .send()
             .await
+            && let Some(val) = parse_set_cookie_buvid3(&collect_set_cookies(resp.headers()))
         {
-            let set_cookies: Vec<String> = resp
-                .headers()
-                .get_all(SET_COOKIE)
-                .iter()
-                .filter_map(|hv| hv.to_str().ok().map(str::to_string))
-                .collect();
-            if let Some(val) = parse_set_cookie_buvid3(&set_cookies) {
-                return val;
-            }
+            return val;
         }
 
         String::new()
@@ -459,15 +429,10 @@ impl BiliApiClient {
         room_uname: &str,
         cookie: Option<&str>,
     ) -> Vec<RawBiliEvent> {
-        let mut req = self
-            .http
-            .get(ACTIVE_SUPER_CHAT_URL)
+        let req = self
+            .live_get(ACTIVE_SUPER_CHAT_URL, cookie)
             .query(&[("room_id", room_id.to_string())])
-            .timeout(Duration::from_secs(3))
-            .header(REFERER, "https://live.bilibili.com/");
-        if let Some(c) = cookie.filter(|s| !s.trim().is_empty()) {
-            req = req.header(COOKIE, c);
-        }
+            .timeout(Duration::from_secs(3));
         match req.send().await {
             Ok(resp) => match resp.json::<Value>().await {
                 Ok(json) => {

@@ -4,11 +4,25 @@ package bili.event;
 
 // Field numbers follow danmuji-next/crates/blivedm's protobuf decoders and real live captures.
 // Separate from the legacy Dm schema so 64-bit user IDs are never truncated.
+message EventNamedFace {
+  string name = 1;
+  string face = 2;
+}
+message EventOfficialInfo {
+  int32 role = 1;
+  string title = 2;
+  string desc = 3;
+  int32 type = 4;
+}
 message EventUserBase {
   string name = 1;
   string face = 2;
   uint32 name_color = 3;
   bool is_mystery = 4;
+  EventNamedFace risk_ctrl_info = 5;
+  EventNamedFace origin_info = 6;
+  EventOfficialInfo official_info = 7;
+  string name_color_str = 8;
 }
 message EventGuard {
   uint32 level = 1;
@@ -19,8 +33,16 @@ message EventWealth {
   string dm_icon_key = 2;
 }
 message EventUserTitle {
+  string old_title_css_id = 1;
+  string title_css_id = 2;
+}
+message EventUheadFrame {
   uint32 id = 1;
-  string icon = 2;
+  string frame_img = 2;
+  string frame_dynamic_img = 3;
+}
+message EventGuardLeader {
+  bool is_guard_leader = 1;
 }
 message EventUserMedal {
   string name = 1;
@@ -30,24 +52,29 @@ message EventUserMedal {
   uint32 color_border = 5;
   uint32 color = 6;
   uint32 id = 7;
+  uint32 typ = 8;
   uint32 is_light = 9;
   uint64 ruid = 10;
   uint32 guard_level = 11;
   uint32 score = 12;
   string guard_icon = 13;
+  string honor_icon = 14;
   string v2_medal_color_start = 15;
   string v2_medal_color_end = 16;
   string v2_medal_color_border = 17;
   string color_v2 = 18;
   string v2_medal_color_level = 19;
+  uint64 user_receive_count = 20;
 }
 message EventUserInfo {
   uint64 uid = 1;
   EventUserBase base = 2;
   EventUserMedal medal = 3;
   EventWealth wealth = 4;
+  EventUserTitle title = 5;
   EventGuard guard = 6;
-  EventUserTitle title = 7;
+  EventUheadFrame uhead_frame = 7;
+  EventGuardLeader guard_leader = 8;
 }
 message EventGiftMedal {
   uint64 ruid = 1;
@@ -73,11 +100,25 @@ message EventGiftInfo {
   string img_basic = 1;
   string webp = 2;
   optional uint64 effect_id = 3;
+  string frame_animation = 4;
   string gif = 5;
+  string has_imaged_gift = 6;
+}
+message EventSendMaster {
+  uint64 uid = 1;
+  string uname = 2;
 }
 message EventReceiveUserInfo {
   string uname = 1;
   uint64 uid = 2;
+}
+message EventGiftBagInfo {
+  uint64 bag_id = 1;
+  uint32 price_for_show = 2;
+}
+message EventGiftEffectInfo {
+  uint32 effect_type = 1;
+  EventGiftBagInfo detail = 2;
 }
 message EventGiftItem {
   uint32 gift_id = 1;
@@ -95,23 +136,32 @@ message EventGiftItem {
   uint64 combo_resources_id = 13;
   uint64 combo_total_coin = 14;
   uint64 combo_stay_time = 15;
+  float magnification = 16;
   optional bool show_batch_combo_send = 17;
   string action = 18;
+  uint64 rcost = 24;
   EventReceiveUserInfo receive_user_info = 29;
   EventUserInfo receiver_uinfo = 33;
+  EventGiftBagInfo bag_gift = 34;
   EventGiftInfo gift_info = 35;
   uint64 gift_tip_price = 36;
+  EventGiftEffectInfo effect_info = 37;
 }
 message EventSendGift {
   uint64 uid = 1;
   string uname = 2;
   string face = 3;
+  string name_color = 4;
   uint64 guard_level = 5;
+  uint64 svga_block = 6;
+  EventSendMaster send_master = 7;
   EventGiftMedal medal_info = 8;
   EventBlindGift blind_gift = 9;
   repeated EventGiftItem gift_items = 10;
   bool is_naming = 11;
+  EventReceiveUserInfo receive_user_info = 12;
   EventWealth wealth = 13;
+  string group_medal = 14;
   EventUserInfo sender_uinfo = 15;
 }
 message EventInteractMedal {
@@ -126,6 +176,19 @@ message EventInteractMedal {
   uint32 guard_level = 9;
   uint32 room_id = 12;
   uint32 score = 13;
+}
+message EventInteractContribution {
+  uint64 grade = 1;
+}
+message EventInteractContributionV2 {
+  uint64 grade = 1;
+  string rank_type = 2;
+  string text = 3;
+}
+message EventGroupMedalBrief {
+  uint64 medal_id = 1;
+  string name = 2;
+  uint64 is_lighted = 3;
 }
 message EventInteractIdentity {
   uint32 rank = 1;
@@ -150,12 +213,16 @@ message EventInteractWord {
   // `timestamp_ms` for backwards compatibility; use `trigger_time` (ns) or `timestamp` (s).
   uint64 timestamp_ms = 8;
   EventInteractMedal medal = 9;
+  EventInteractContribution contribution = 12;
   uint64 trigger_time = 15;
   uint32 guard_type = 16;
   uint32 privilege_type = 17;
   EventInteractIdentity identity = 19;
+  EventInteractContributionV2 contribution_v2 = 20;
+  EventGroupMedalBrief group_medal = 21;
   EventUserInfo uinfo = 22;
   EventRelationTail relation_tail = 23;
+  string dmscore = 24;
 }
 message EventOnlineRankUser {
   uint64 uid = 1;
@@ -169,6 +236,7 @@ message EventOnlineRankUser {
 }
 message EventOnlineRank {
   string rank_type = 1;
+  repeated EventOnlineRankUser list = 2;
   repeated EventOnlineRankUser online_list = 3;
 }
 
@@ -212,11 +280,38 @@ message EventDmUser {
   int32 attr = 10;
   EventDmMedal medal = 11;
   EventDmLevel level = 12;
+  EventUserTitle title = 13;
+  EventGuard guard = 14;
   EventWealth wealth = 15;
+  EventUheadFrame uhead_frame = 16;
 }
 message EventDmRoom {
   uint64 uid = 1;
   string name = 2;
+}
+message EventDmBubble {
+  uint32 id = 1;
+  string color = 2;
+  int32 id_v2 = 3;
+}
+message EventDmVoice {
+  string url = 1;
+  string file_format = 2;
+  string text = 3;
+  int64 file_duration = 4;
+  string file_id = 5;
+}
+message EventDmAggregation {
+  bool is_aggregation = 1;
+  int64 activity_source = 2;
+  string activity_identity = 3;
+  int32 not_show = 4;
+}
+message EventDmReply {
+  bool show_reply = 1;
+  uint64 reply_mid = 2;
+  string reply_uname = 3;
+  string reply_uname_color = 4;
 }
 message EventDm {
   string id_str = 1;
@@ -230,9 +325,15 @@ message EventDm {
   int64 rnd = 9;
   int32 attr = 10;
   int32 biz_scene = 11;
+  EventDmBubble bubble = 12;
   int32 dm_type = 13;
   map<string, EventDmEmoticon> emoticons = 14;
+  EventDmVoice voice = 15;
+  string animation = 16;
+  EventDmAggregation aggregation = 17;
   bool send_from_me = 18;
+  int32 check_info_status = 19;
   EventDmUser user = 20;
   EventDmRoom room = 21;
+  EventDmReply reply = 22;
 }

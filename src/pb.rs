@@ -1,4 +1,3 @@
-// src/pb.rs
 //! Protobuf schemas generated from `event.proto` and schema-driven raw packet enrichment.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -47,18 +46,15 @@ pub fn decode_dm(bytes: &[u8]) -> Option<EventDm> {
 }
 
 pub fn extract_event_user_info(info: &EventUserInfo) -> PbExtractedUser {
-    let uname = info
+    let (uname, face) = info
         .base
         .as_ref()
-        .map(|b| b.name.trim())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let face = info
-        .base
-        .as_ref()
-        .map(|b| b.face.trim())
-        .filter(|s| !s.is_empty())
-        .map(normalize_bili_url);
+        .map(|b| {
+            let name = (!b.name.trim().is_empty()).then(|| b.name.trim().to_string());
+            let face = (!b.face.trim().is_empty()).then(|| normalize_bili_url(&b.face));
+            (name, face)
+        })
+        .unwrap_or((None, None));
     let (medal_name, medal_level) = info
         .medal
         .as_ref()
@@ -93,20 +89,17 @@ fn decode_proto_field_to_json(base_cmd: Option<&str>, key: &str, bytes: &[u8]) -
     if bytes.is_empty() {
         return None;
     }
-    if key == "dm_v2" {
-        return decode_dm(bytes).and_then(|msg| serde_json::to_value(msg).ok());
+    if key == "dm_v2" || base_cmd == Some("DANMU_MSG") {
+        return serde_json::to_value(decode_dm(bytes)?).ok();
     }
-    match base_cmd {
-        Some("INTERACT_WORD_V2") => {
-            decode_interact_word(bytes).and_then(|msg| serde_json::to_value(msg).ok())
+    match base_cmd? {
+        "INTERACT_WORD_V2" | "INTERACT_WORD" => {
+            serde_json::to_value(decode_interact_word(bytes)?).ok()
         }
-        Some("SEND_GIFT_V2") => {
-            decode_send_gift(bytes).and_then(|msg| serde_json::to_value(msg).ok())
+        "SEND_GIFT_V2" | "SEND_GIFT" => serde_json::to_value(decode_send_gift(bytes)?).ok(),
+        "ONLINE_RANK_V2" | "ONLINE_RANK_V3" => {
+            serde_json::to_value(decode_online_rank(bytes)?).ok()
         }
-        Some("ONLINE_RANK_V2" | "ONLINE_RANK_V3") => {
-            decode_online_rank(bytes).and_then(|msg| serde_json::to_value(msg).ok())
-        }
-        Some("DANMU_MSG") => decode_dm(bytes).and_then(|msg| serde_json::to_value(msg).ok()),
         _ => None,
     }
 }
